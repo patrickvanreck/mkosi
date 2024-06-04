@@ -1,70 +1,65 @@
 # SPDX-License-Identifier: LGPL-2.1+
+from collections.abc import Iterator
+from typing import Any, cast
 
-import sys
-import os
+import pytest
 
-import mkosi
+from mkosi.config import parse_config
+from mkosi.distributions import Distribution, detect_distribution
 
-from tests.test_config_parser import MkosiConfig
-
-
-class DictDiffer(object):
-    def __init__(self, expected_dict, current_dict):
-        self.current_dict = current_dict
-        self.expected_dict = expected_dict
-        self.set_current, self.set_past = set(current_dict.keys()), set(expected_dict.keys())
-        self.intersect = self.set_current.intersection(self.set_past)
-
-    @property
-    def unexpected(self):
-        return ["%s=%s" % (k, self.current_dict[k]) for k in self.set_current - self.intersect]
-
-    @property
-    def missing(self):
-        return [str(k) for k in self.set_past - self.intersect]
-
-    @property
-    def invalid(self):
-        inva = set(o for o in self.intersect if self.expected_dict[o] != self.current_dict[o])
-        return ["%s=%s (exp: %s)" % (k, self.current_dict[k], self.expected_dict[k]) for k in inva]
-
-    @property
-    def valid(self):
-        return set(o for o in self.intersect if self.expected_dict[o] == self.current_dict[o])
+from . import Image, ci_group
 
 
-def pytest_assertrepr_compare(op, left, right):
-    if not isinstance(left, MkosiConfig):
-        return
-    if not isinstance(right, dict):
-        return
-    for r in right.values():
-        if not isinstance(vars(r), dict):
-            return ["Invalid datatype"]
-    if op == "==":
+def pytest_addoption(parser: Any) -> None:
+    parser.addoption(
+        "-D",
+        "--distribution",
+        metavar="DISTRIBUTION",
+        help="Run the integration tests for the given distribution.",
+        default=detect_distribution()[0],
+        type=Distribution,
+        choices=[Distribution(d) for d in Distribution.values()],
+    )
+    parser.addoption(
+        "-R",
+        "--release",
+        metavar="RELEASE",
+        help="Run the integration tests for the given release.",
+    )
+    parser.addoption(
+        "-T",
+        "--tools-tree-distribution",
+        metavar="DISTRIBUTION",
+        help="Use the given tools tree distribution to build the integration test images",
+        type=Distribution,
+        choices=[Distribution(d) for d in Distribution.values()],
+    )
+    parser.addoption(
+        "--tools-tree-release",
+        metavar="RELEASE",
+        help="Use the given tools tree release instead of the default one",
+    )
+    parser.addoption(
+        "--debug-shell",
+        help="Pass --debug-shell when running mkosi",
+        action="store_true",
+    )
 
-        def compare_job_args(job, l_a, r_a):
-            ddiff = DictDiffer(l_a, r_a)
-            ret.append("Comparing parsed configuration %s against expected configuration:" % job)
-            ret.append("unexpected:")
-            ret.extend(["- %s" % i for i in ddiff.unexpected])
-            ret.append("missing:")
-            ret.extend(["- %s" % i for i in ddiff.missing])
-            ret.append("invalid:")
-            ret.extend(["- %s" % i for i in ddiff.invalid])
 
-        verified_keys = []
-        ret = ["MkosiConfig is not equal to parsed args"]
-        for right_job, right_args in right.items():
-            try:
-                left_args = left.reference_config[right_job]
-            except KeyError:
-                ret.append("Unexpected job: %s" % right_job)
-                continue
-            r_v = vars(right_args)
-            compare_job_args(right_job, left_args, r_v)
-            verified_keys.append(right_job)
-        for left_job in left.reference_config:
-            if not left_job in verified_keys:
-                ret.append("Missing job: %s" % left_job)
-        return ret
+@pytest.fixture(scope="session")
+def config(request: Any) -> Image.Config:
+    distribution = cast(Distribution, request.config.getoption("--distribution"))
+    release = cast(str, request.config.getoption("--release") or parse_config(["-d", str(distribution)])[1][0].release)
+    return Image.Config(
+        distribution=distribution,
+        release=release,
+        tools_tree_distribution=cast(Distribution, request.config.getoption("--tools-tree-distribution")),
+        tools_tree_release=request.config.getoption("--tools-tree-release"),
+        debug_shell=request.config.getoption("--debug-shell"),
+    )
+
+
+@pytest.fixture(autouse=True)
+def ci_sections(request: Any) -> Iterator[None]:
+    with ci_group(request.node.name):
+        yield

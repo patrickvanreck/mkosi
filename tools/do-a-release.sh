@@ -1,20 +1,31 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1+
 
-if [ x"$1" == x ] ; then
+if [ -z "$1" ] ; then
     echo "Version number not specified."
     exit 1
 fi
 
-sed -i 's/version=".*",/version="'"$1"'",/' setup.py
-sed -i "s/__version__ = \".*\"/__version__ = \"$1\"/" mkosi/__init__.py
-sed -i "s/MKOSI_TAG: '.*'/MKOSI_TAG: $1/" action.yaml
+VERSION="$1"
 
-git add -p setup.py mkosi action.yaml
+if ! git diff-index --quiet HEAD; then
+    echo "Repo has modified files."
+    exit 1
+fi
 
-pandoc -t man -s -o man/mkosi.1 mkosi.md
-git add man/mkosi.1
+sed -r -i "s/^version = \".*\"$/version = \"$VERSION\"/" pyproject.toml
+sed -r -i "s/^__version__ = \".*\"$/__version__ = \"$VERSION\"/" mkosi/config.py
 
-git commit -m "bump version numbers for v$1"
+git add -p pyproject.toml mkosi
 
-git tag -s "v$1" -m "mkosi $1"
+git commit -m "Release $VERSION"
+
+git tag -s "v$VERSION" -m "mkosi $VERSION"
+
+VERSION="$((VERSION + 1))~devel"
+
+sed -r -i "s/^__version__ = \".*\"$/__version__ = \"$VERSION\"/" mkosi/config.py
+
+git add -p mkosi
+
+git commit -m "Bump version to $VERSION"

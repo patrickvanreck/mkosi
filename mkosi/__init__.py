@@ -1,4044 +1,2602 @@
 # SPDX-License-Identifier: LGPL-2.1+
 
-import argparse
-import collections
-import configparser
 import contextlib
-import copy
-import crypt
-import ctypes
-import ctypes.util
+import dataclasses
 import datetime
-import enum
-import errno
-import fcntl
-import getpass
-import glob
-import time
 import hashlib
+import io
+import itertools
+import json
+import logging
 import os
-import platform
+import re
+import resource
 import shlex
 import shutil
-import signal
+import socket
 import stat
-import string
 import subprocess
 import sys
 import tempfile
-import json
-import urllib.request
-import re
-import urllib.parse
+import textwrap
 import uuid
-from subprocess import DEVNULL, PIPE
-from textwrap import dedent
-from typing import (
-    IO,
-    Any,
-    BinaryIO,
-    Callable,
-    Dict,
-    Generator,
-    Iterable,
-    List,
-    NamedTuple,
-    NoReturn,
-    Optional,
-    Sequence,
-    Set,
-    TextIO,
-    Tuple,
-    TypeVar,
-    Union,
-    cast,
-    TYPE_CHECKING,
-    ContextManager,
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
+from pathlib import Path
+from typing import Optional, Union, cast
+
+from mkosi.archive import extract_tar, make_cpio, make_tar
+from mkosi.burn import run_burn
+from mkosi.config import (
+    Args,
+    BiosBootloader,
+    Bootloader,
+    Cacheonly,
+    Compression,
+    Config,
+    ConfigFeature,
+    DocFormat,
+    JsonEncoder,
+    KeySource,
+    ManifestFormat,
+    Network,
+    OutputFormat,
+    SecureBootSignTool,
+    ShimBootloader,
+    Verb,
+    Vmm,
+    __version__,
+    format_bytes,
+    parse_config,
+    summary,
+    systemd_tool_version,
+    want_selinux_relabel,
+    yes_no,
 )
-from types import FrameType
-
-from .printer import MkosiPrinter
-
-
-__version__ = "9"
-
-
-# These types are only generic during type checking and not at runtime, leading
-# to a TypeError during compilation.
-# Let's be as strict as we can with the description for the usage we have.
-if TYPE_CHECKING:
-    CompletedProcess = subprocess.CompletedProcess[Any]
-    TempDir = tempfile.TemporaryDirectory[str]
-else:
-    CompletedProcess = subprocess.CompletedProcess
-    TempDir = tempfile.TemporaryDirectory
-
-
-MKOSI_COMMANDS_CMDLINE = ("build", "shell", "boot", "qemu", "ssh")
-MKOSI_COMMANDS_NEED_BUILD = ("shell", "boot", "qemu")
-MKOSI_COMMANDS_SUDO = ("build", "clean", "shell", "boot", "qemu")
-MKOSI_COMMANDS = ("build", "clean", "help", "summary", "genkey") + MKOSI_COMMANDS_CMDLINE
-
-DRACUT_SYSTEMD_EXTRAS = [
-    "/usr/lib/systemd/systemd-veritysetup",
-    "/usr/lib/systemd/system-generators/systemd-veritysetup-generator",
-    "/usr/bin/systemd-repart",
-    "/usr/lib/systemd/system/systemd-repart.service",
-    "/usr/lib/systemd/system/initrd-root-fs.target.wants/systemd-repart.service",
-]
-
-DRACUT_UNIFIED_KERNEL_INSTALL = """\
-#!/bin/bash -e
-
-COMMAND="$1"
-KERNEL_VERSION="$2"
-BOOT_DIR_ABS="$3"
-KERNEL_IMAGE="$4"
-ROOTHASH="${5:-}"
-
-# If KERNEL_INSTALL_MACHINE_ID is defined but empty, BOOT_DIR_ABS is a fake directory so let's skip creating
-# the unified kernel image.
-if [[ -z "${KERNEL_INSTALL_MACHINE_ID-unset}" ]]; then
-    exit 0
-fi
-
-# Strip machine ID and kernel version to get the boot directory.
-PREFIX=$(dirname $(dirname "$BOOT_DIR_ABS"))
-
-if [[ -n "$ROOTHASH" ]]; then
-    BOOT_BINARY="${PREFIX}/EFI/Linux/linux-${KERNEL_VERSION}-${ROOTHASH}.efi"
-else
-    BOOT_BINARY="${PREFIX}/EFI/Linux/linux-${KERNEL_VERSION}.efi"
-fi
-
-case "$COMMAND" in
-    add)
-        if [[ -f /etc/kernel/cmdline ]]; then
-            read -r -d '' BOOT_OPTIONS < /etc/kernel/cmdline || true
-        elif [[ -f /usr/lib/kernel/cmdline ]]; then
-            read -r -d '' BOOT_OPTIONS < /usr/lib/kernel/cmdline || true
-        else
-            read -r -d '' BOOT_OPTIONS < /proc/cmdline || true
-        fi
-
-        if [[ -n "$ROOTHASH" ]]; then
-            BOOT_OPTIONS="${BOOT_OPTIONS} roothash=${ROOTHASH}"
-        fi
-
-        if [[ -n "$KERNEL_IMAGE" ]]; then
-            DRACUT_KERNEL_IMAGE_OPTION="--kernel-image ${KERNEL_IMAGE}"
-        else
-            DRACUT_KERNEL_IMAGE_OPTION=""
-        fi
-
-        dracut \\
-            --uefi \\
-            --kver "$KERNEL_VERSION" \\
-            $DRACUT_KERNEL_IMAGE_OPTION \\
-            --kernel-cmdline "$BOOT_OPTIONS" \\
-            --force \\
-            "$BOOT_BINARY"
-        ;;
-    remove)
-        rm -f -- "$BOOT_BINARY"
-        ;;
-esac
-"""
-
-
-# This global should be initialized after parsing arguments
-arg_debug = ()
-
-
-class MkosiException(Exception):
-    """Leads to sys.exit"""
-
-
-def print_running_cmd(cmdline: Iterable[str]) -> None:
-    MkosiPrinter.print_step("Running command:")
-    MkosiPrinter.print_step(" ".join(shlex.quote(x) for x in cmdline) + "\n")
+from mkosi.context import Context
+from mkosi.distributions import Distribution
+from mkosi.installer import clean_package_manager_metadata
+from mkosi.kmod import gen_required_kernel_modules, process_kernel_modules
+from mkosi.log import ARG_DEBUG, complete_step, die, log_notice, log_step
+from mkosi.manifest import Manifest
+from mkosi.mounts import finalize_crypto_mounts, finalize_source_mounts, mount_overlay
+from mkosi.pager import page
+from mkosi.partition import Partition, finalize_root, finalize_roothash
+from mkosi.qemu import KernelType, copy_ephemeral, run_qemu, run_ssh, start_journal_remote
+from mkosi.run import (
+    find_binary,
+    fork_and_wait,
+    run,
+)
+from mkosi.sandbox import Mount, chroot_cmd, finalize_passwd_mounts
+from mkosi.tree import copy_tree, move_tree, rmtree
+from mkosi.types import PathString
+from mkosi.user import CLONE_NEWNS, INVOKING_USER, become_root, unshare
+from mkosi.util import (
+    flatten,
+    flock,
+    flock_or_die,
+    format_rlimit,
+    hash_file,
+    make_executable,
+    one_zero,
+    read_env_file,
+    round_up,
+    scopedenv,
+    umask,
+)
+from mkosi.versioncomp import GenericVersion
+from mkosi.vmspawn import run_vmspawn
 
 
 @contextlib.contextmanager
-def delay_interrupt() -> Generator[None, None, None]:
-    # CTRL+C is sent to the entire process group. We delay its handling in mkosi itself so the subprocess can
-    # exit cleanly before doing mkosi's cleanup. If we don't do this, we get device or resource is busy
-    # errors when unmounting stuff later on during cleanup. We only delay a single CTRL+C interrupt so that a
-    # user can always exit mkosi even if a subprocess hangs by pressing CTRL+C twice.
-    interrupted = False
-
-    def handler(signal: int, frame: FrameType) -> None:
-        nonlocal interrupted
-        if interrupted:
-            raise KeyboardInterrupt()
-        else:
-            interrupted = True
-
-    s = signal.signal(signal.SIGINT, handler)
-
-    try:
+def mount_base_trees(context: Context) -> Iterator[None]:
+    if not context.config.base_trees or not context.config.overlay:
         yield
-    finally:
-        signal.signal(signal.SIGINT, s)
-
-        if interrupted:
-            die("Interrupted")
-
-
-# Borrowed from https://github.com/python/typeshed/blob/3d14016085aed8bcf0cf67e9e5a70790ce1ad8ea/stdlib/3/subprocess.pyi#L24
-_FILE = Union[None, int, IO[Any]]
-
-
-def run(
-    cmdline: List[str],
-    check: bool = True,
-    stdout: _FILE = None,
-    stderr: _FILE = None,
-    **kwargs: Any,
-) -> CompletedProcess:
-    if "run" in arg_debug:
-        MkosiPrinter.info("+ " + " ".join(shlex.quote(x) for x in cmdline))
-
-    if not stdout and not stderr:
-        # Unless explicit redirection is done, print all subprocess output on stderr since we do so as well
-        # for mkosi's own output.
-        stdout = sys.stderr
-
-    try:
-        with delay_interrupt():
-            return subprocess.run(cmdline, check=check, stdout=stdout, stderr=stderr, **kwargs)
-    except FileNotFoundError:
-        die(f"{cmdline[0]} not found in PATH.")
-
-
-def die(message: str) -> NoReturn:
-    MkosiPrinter.warn(f"Error: {message}")
-    raise MkosiException(message)
-
-
-def warn(message: str) -> None:
-    MkosiPrinter.warn(f"Warning: {message}")
-
-
-def tmp_dir() -> str:
-    return os.environ.get("TMPDIR") or "/var/tmp"
-
-
-class CommandLineArguments(argparse.Namespace):
-    """Type-hinted storage for command line arguments."""
-
-    swap_partno: Optional[int] = None
-    esp_partno: Optional[int] = None
-    xbootldr_partno: Optional[int] = None
-    minimize: bool = False
-
-    def generated_root(self) -> bool:
-        """Returns whether this configuration means we need to generate a file system from a prepared tree
-
-        This is needed for anything squashfs and when root minimization is required."""
-        return self.minimize or self.output_format.is_squashfs()
-
-
-class SourceFileTransfer(enum.Enum):
-    copy_all = "copy-all"
-    copy_git_cached = "copy-git-cached"
-    copy_git_others = "copy-git-others"
-    copy_git_more = "copy-git-more"
-    mount = "mount"
-
-    def __str__(self) -> str:
-        return self.value
-
-    @classmethod
-    def doc(cls) -> Dict["SourceFileTransfer", str]:
-        return {
-            cls.copy_all: "normal file copy",
-            cls.copy_git_cached: "use git-ls-files --cached, ignoring any file that git itself ignores",
-            cls.copy_git_others: "use git-ls-files --others, ignoring any file that git itself ignores",
-            cls.copy_git_more: "use git-ls-files --cached, ignoring any file that git itself ignores, but include the .git/ directory",
-            cls.mount: "bind mount source files into the build image",
-        }
-
-
-class OutputFormat(enum.Enum):
-    directory = enum.auto()
-    subvolume = enum.auto()
-    tar = enum.auto()
-
-    gpt_ext4 = enum.auto()
-    gpt_xfs = enum.auto()
-    gpt_btrfs = enum.auto()
-    gpt_squashfs = enum.auto()
-
-    plain_squashfs = enum.auto()
-
-    # Kept for backwards compatibility
-    raw_ext4 = raw_gpt = gpt_ext4
-    raw_xfs = gpt_xfs
-    raw_btrfs = gpt_btrfs
-    raw_squashfs = gpt_squashfs
-
-    def __repr__(self) -> str:
-        """Return the member name without the class name"""
-        return self.name
-
-    def __str__(self) -> str:
-        """Return the member name without the class name"""
-        return self.name
-
-    @classmethod
-    def from_string(cls, name: str) -> "OutputFormat":
-        """A convenience method to be used with argparse"""
-        try:
-            return cls[name]
-        except KeyError:
-            # this let's argparse generate a proper error message
-            return name  # type: ignore
-
-    def is_disk_rw(self) -> bool:
-        "Output format is a disk image with a parition table and a writable filesystem"
-        return self in (OutputFormat.gpt_ext4, OutputFormat.gpt_xfs, OutputFormat.gpt_btrfs)
-
-    def is_disk(self) -> bool:
-        "Output format is a disk image with a partition table"
-        return self.is_disk_rw() or self == OutputFormat.gpt_squashfs
-
-    def is_squashfs(self) -> bool:
-        "The output format contains a squashfs partition"
-        return self in {OutputFormat.gpt_squashfs, OutputFormat.plain_squashfs}
-
-    def can_minimize(self) -> bool:
-        "The output format can be 'minimized'"
-        return self in (OutputFormat.gpt_ext4, OutputFormat.gpt_btrfs)
-
-    def needed_kernel_module(self) -> str:
-        if self == OutputFormat.gpt_btrfs:
-            return "btrfs"
-        elif self == OutputFormat.gpt_squashfs or self == OutputFormat.plain_squashfs:
-            return "squashfs"
-        elif self == OutputFormat.gpt_xfs:
-            return "xfs"
-        else:
-            return "ext4"
-
-
-class Distribution(enum.Enum):
-    fedora = 1
-    debian = 2
-    ubuntu = 3
-    arch = 4
-    opensuse = 5
-    mageia = 6
-    centos = 7
-    centos_epel = 8
-    clear = 9
-    photon = 10
-    openmandriva = 11
-
-    def __str__(self) -> str:
-        return self.name
-
-
-# fmt: off
-GPT_ROOT_X86           = uuid.UUID("44479540f29741b29af7d131d5f0458a")  # NOQA: E221
-GPT_ROOT_X86_64        = uuid.UUID("4f68bce3e8cd4db196e7fbcaf984b709")  # NOQA: E221
-GPT_ROOT_ARM           = uuid.UUID("69dad7102ce44e3cb16c21a1d49abed3")  # NOQA: E221
-GPT_ROOT_ARM_64        = uuid.UUID("b921b0451df041c3af444c6f280d3fae")  # NOQA: E221
-GPT_ROOT_IA64          = uuid.UUID("993d8d3df80e4225855a9daf8ed7ea97")  # NOQA: E221
-GPT_ESP                = uuid.UUID("c12a7328f81f11d2ba4b00a0c93ec93b")  # NOQA: E221
-GPT_BIOS               = uuid.UUID("2168614864496e6f744e656564454649")  # NOQA: E221
-GPT_SWAP               = uuid.UUID("0657fd6da4ab43c484e50933c84b4f4f")  # NOQA: E221
-GPT_HOME               = uuid.UUID("933ac7e12eb44f13b8440e14e2aef915")  # NOQA: E221
-GPT_SRV                = uuid.UUID("3b8f842520e04f3b907f1a25a76f98e8")  # NOQA: E221
-GPT_XBOOTLDR           = uuid.UUID("bc13c2ff59e64262a352b275fd6f7172")  # NOQA: E221
-GPT_ROOT_X86_VERITY    = uuid.UUID("d13c5d3bb5d1422ab29f9454fdc89d76")  # NOQA: E221
-GPT_ROOT_X86_64_VERITY = uuid.UUID("2c7357edebd246d9aec123d437ec2bf5")  # NOQA: E221
-GPT_ROOT_ARM_VERITY    = uuid.UUID("7386cdf2203c47a9a498f2ecce45a2d6")  # NOQA: E221
-GPT_ROOT_ARM_64_VERITY = uuid.UUID("df3300ced69f4c92978c9bfb0f38d820")  # NOQA: E221
-GPT_ROOT_IA64_VERITY   = uuid.UUID("86ed10d5b60745bb8957d350f23d0571")  # NOQA: E221
-GPT_TMP                = uuid.UUID("7ec6f5573bc54acab29316ef5df639d1")  # NOQA: E221
-GPT_VAR                = uuid.UUID("4d21b016b53445c2a9fb5c16e091fd2d")  # NOQA: E221
-# fmt: on
-
-
-# This is a non-formatted partition used to store the second stage
-# part of the bootloader because it doesn't necessarily fits the MBR
-# available space. 1MiB is more than enough for our usages and there's
-# little reason for customization since it only stores the bootloader and
-# not user-owned configuration files or kernels. See
-# https://en.wikipedia.org/wiki/BIOS_boot_partition
-# and https://www.gnu.org/software/grub/manual/grub/html_node/BIOS-installation.html
-BIOS_PARTITION_SIZE = 1024 * 1024
-
-CLONE_NEWNS = 0x00020000
-
-FEDORA_KEYS_MAP = {
-    "23": "34EC9CBA",
-    "24": "81B46521",
-    "25": "FDB19C98",
-    "26": "64DAB85D",
-    "27": "F5282EE4",
-    "28": "9DB62FB1",
-    "29": "429476B4",
-    "30": "CFC659B9",
-    "31": "3C3359C4",
-    "32": "12C944D0",
-}
-
-# 1 MB at the beginning of the disk for the GPT disk label, and
-# another MB at the end (this is actually more than needed.)
-GPT_HEADER_SIZE = 1024 * 1024
-GPT_FOOTER_SIZE = 1024 * 1024
-
-
-# Debian calls their architectures differently, so when calling debootstrap we
-# will have to map to their names
-DEBIAN_ARCHITECTURES = {
-    "x86_64": "amd64",
-    "x86": "i386",
-    "aarch64": "arm64",
-    "armhfp": "armhf",
-}
-
-
-class GPTRootTypePair(NamedTuple):
-    root: uuid.UUID
-    verity: uuid.UUID
-
-
-def gpt_root_native(arch: Optional[str]) -> GPTRootTypePair:
-    """The tag for the native GPT root partition for the given architecture
-
-    Returns a tuple of two tags: for the root partition and for the
-    matching verity partition.
-    """
-    if arch is None:
-        arch = platform.machine()
-    if arch == "x86_64":
-        return GPTRootTypePair(GPT_ROOT_X86_64, GPT_ROOT_X86_64_VERITY)
-    elif arch == "aarch64":
-        return GPTRootTypePair(GPT_ROOT_ARM_64, GPT_ROOT_ARM_64_VERITY)
-    elif arch == "armv7l":
-        return GPTRootTypePair(GPT_ROOT_ARM, GPT_ROOT_ARM_VERITY)
-    else:
-        die(f"Unknown architecture {arch}.")
-
-
-def unshare(flags: int) -> None:
-    libc_name = ctypes.util.find_library("c")
-    if libc_name is None:
-        die("Could not find libc")
-    libc = ctypes.CDLL(libc_name, use_errno=True)
-
-    if libc.unshare(ctypes.c_int(flags)) != 0:
-        e = ctypes.get_errno()
-        raise OSError(e, os.strerror(e))
-
-
-def format_bytes(num_bytes: int) -> str:
-    if num_bytes >= 1024 * 1024 * 1024:
-        return f"{num_bytes/1024**3 :0.1f}G"
-    if num_bytes >= 1024 * 1024:
-        return f"{num_bytes/1024**2 :0.1f}M"
-    if num_bytes >= 1024:
-        return f"{num_bytes/1024 :0.1f}K"
-
-    return f"{num_bytes}B"
-
-
-def roundup512(x: int) -> int:
-    return (x + 511) & ~511
-
-
-def mkdir_last(path: str, mode: int = 0o777) -> str:
-    """Create directory path
-
-    Only the final component will be created, so this is different than mkdirs().
-    """
-    try:
-        os.mkdir(path, mode)
-    except FileExistsError:
-        if not os.path.isdir(path):
-            raise
-    return path
-
-
-# fmt: off
-_IOC_NRBITS   =  8  # NOQA: E221,E222
-_IOC_TYPEBITS =  8  # NOQA: E221,E222
-_IOC_SIZEBITS = 14  # NOQA: E221,E222
-_IOC_DIRBITS  =  2  # NOQA: E221,E222
-
-_IOC_NRSHIFT   = 0  # NOQA: E221
-_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS  # NOQA: E221
-_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS  # NOQA: E221
-_IOC_DIRSHIFT  = _IOC_SIZESHIFT + _IOC_SIZEBITS  # NOQA: E221
-
-_IOC_NONE  = 0  # NOQA: E221
-_IOC_WRITE = 1  # NOQA: E221
-_IOC_READ  = 2  # NOQA: E221
-# fmt: on
-
-
-def _IOC(dir_rw: int, type_drv: int, nr: int, argtype: str) -> int:
-    size = {"int": 4, "size_t": 8}[argtype]
-    return dir_rw << _IOC_DIRSHIFT | type_drv << _IOC_TYPESHIFT | nr << _IOC_NRSHIFT | size << _IOC_SIZESHIFT
-
-
-def _IOW(type_drv: int, nr: int, size: str) -> int:
-    return _IOC(_IOC_WRITE, type_drv, nr, size)
-
-
-FICLONE = _IOW(0x94, 9, "int")
-
-
-@contextlib.contextmanager
-def open_close(path: str, flags: int, mode: int = 0o664) -> Generator[int, None, None]:
-    fd = os.open(path, flags | os.O_CLOEXEC, mode)
-    try:
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def _reflink(oldfd: int, newfd: int) -> None:
-    fcntl.ioctl(newfd, FICLONE, oldfd)
-
-
-def copy_fd(oldfd: int, newfd: int) -> None:
-    try:
-        _reflink(oldfd, newfd)
-    except OSError as e:
-        if e.errno not in {errno.EXDEV, errno.EOPNOTSUPP}:
-            raise
-        shutil.copyfileobj(open(oldfd, "rb", closefd=False), open(newfd, "wb", closefd=False))
-
-
-def copy_file_object(oldobject: BinaryIO, newobject: BinaryIO) -> None:
-    try:
-        _reflink(oldobject.fileno(), newobject.fileno())
-    except OSError as e:
-        if e.errno not in {errno.EXDEV, errno.EOPNOTSUPP}:
-            raise
-        shutil.copyfileobj(oldobject, newobject)
-
-
-def copy_symlink(oldpath: str, newpath: str) -> None:
-    src = os.readlink(oldpath)
-    os.symlink(src, newpath)
-
-
-def copy_file(oldpath: str, newpath: str) -> None:
-    if os.path.islink(oldpath):
-        copy_symlink(oldpath, newpath)
         return
 
-    with open_close(oldpath, os.O_RDONLY) as oldfd:
-        st = os.stat(oldfd)
+    with complete_step("Mounting base trees…"), contextlib.ExitStack() as stack:
+        bases = []
+        (context.workspace / "bases").mkdir(exist_ok=True)
 
-        try:
-            with open_close(newpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, st.st_mode) as newfd:
-                copy_fd(oldfd, newfd)
-        except FileExistsError:
-            os.unlink(newpath)
-            with open_close(newpath, os.O_WRONLY | os.O_CREAT, st.st_mode) as newfd:
-                copy_fd(oldfd, newfd)
-    shutil.copystat(oldpath, newpath, follow_symlinks=False)
+        for path in context.config.base_trees:
+            d = context.workspace / f"bases/{path.name}-{uuid.uuid4().hex}"
 
-
-def symlink_f(target: str, path: str) -> None:
-    try:
-        os.symlink(target, path)
-    except FileExistsError:
-        os.unlink(path)
-        os.symlink(target, path)
-
-
-def copy_path(oldpath: str, newpath: str) -> None:
-    try:
-        mkdir_last(newpath)
-    except FileExistsError:
-        # something that is not a directory already exists
-        os.unlink(newpath)
-        mkdir_last(newpath)
-
-    for entry in os.scandir(oldpath):
-        newentry = os.path.join(newpath, entry.name)
-        if entry.is_dir(follow_symlinks=False):
-            copy_path(entry.path, newentry)
-        elif entry.is_symlink():
-            target = os.readlink(entry.path)
-            symlink_f(target, newentry)
-            shutil.copystat(entry.path, newentry, follow_symlinks=False)
-        else:
-            st = entry.stat(follow_symlinks=False)
-            if stat.S_ISREG(st.st_mode):
-                copy_file(entry.path, newentry)
+            if path.is_dir():
+                bases += [path]
+            elif path.suffix == ".tar":
+                extract_tar(path, d, sandbox=context.sandbox)
+                bases += [d]
+            elif path.suffix == ".raw":
+                run(["systemd-dissect", "-M", path, d])
+                stack.callback(lambda: run(["systemd-dissect", "-U", d]))
+                bases += [d]
             else:
-                print("Ignoring", entry.path)
-                continue
-    shutil.copystat(oldpath, newpath, follow_symlinks=True)
+                die(f"Unsupported base tree source {path}")
 
+        stack.enter_context(mount_overlay(bases, context.root, context.root))
 
-@contextlib.contextmanager
-def complete_step(text: str, text2: Optional[str] = None) -> Generator[List[Any], None, None]:
-    MkosiPrinter.print_step(text + "...")
-    args: List[Any] = []
-    yield args
-    if text2 is not None:
-        MkosiPrinter.print_step(text2.format(*args) + ".")
-
-
-@complete_step("Detaching namespace")
-def init_namespace(args: CommandLineArguments) -> None:
-    args.original_umask = os.umask(0o000)
-    unshare(CLONE_NEWNS)
-    run(["mount", "--make-rslave", "/"])
-
-
-def setup_workspace(args: CommandLineArguments) -> TempDir:
-    MkosiPrinter.print_step("Setting up temporary workspace.")
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
-        d = tempfile.TemporaryDirectory(dir=os.path.dirname(args.output), prefix=".mkosi-")
-    else:
-        d = tempfile.TemporaryDirectory(dir=tmp_dir(), prefix="mkosi-")
-
-    MkosiPrinter.print_step("Temporary workspace in " + d.name + " is now set up.")
-    return d
-
-
-def btrfs_subvol_create(path: str, mode: int = 0o755) -> None:
-    m = os.umask(~mode & 0o7777)
-    run(["btrfs", "subvol", "create", path])
-    os.umask(m)
-
-
-def btrfs_subvol_delete(path: str) -> None:
-    # Extract the path of the subvolume relative to the filesystem
-    c = run(["btrfs", "subvol", "show", path], stdout=PIPE, stderr=DEVNULL, universal_newlines=True)
-    subvol_path = c.stdout.splitlines()[0]
-    # Make the subvolume RW again if it was set RO by btrfs_subvol_delete
-    run(["btrfs", "property", "set", path, "ro", "false"])
-    # Recursively delete the direct children of the subvolume
-    c = run(["btrfs", "subvol", "list", "-o", path], stdout=PIPE, stderr=DEVNULL, universal_newlines=True)
-    for line in c.stdout.splitlines():
-        if not line:
-            continue
-        child_subvol_path = line.split(" ", 8)[-1]
-        child_path = os.path.normpath(os.path.join(path, os.path.relpath(child_subvol_path, subvol_path)))
-        btrfs_subvol_delete(child_path)
-    # Delete the subvolume now that all its descendants have been deleted
-    run(["btrfs", "subvol", "delete", path], stdout=DEVNULL, stderr=DEVNULL)
-
-
-def btrfs_subvol_make_ro(path: str, b: bool = True) -> None:
-    run(["btrfs", "property", "set", path, "ro", "true" if b else "false"])
-
-
-@contextlib.contextmanager
-def btrfs_forget_stale_devices() -> Generator[None, None, None]:
-    # When using cached images (-i), mounting btrfs images would sometimes fail
-    # with EEXIST. This is likely because a stale device is leftover somewhere
-    # from the previous run. To fix this, we make sure to always clean up stale
-    # btrfs devices after unmounting the image.
-    try:
         yield
-    finally:
-        if shutil.which("btrfs"):
-            run(["btrfs", "device", "scan", "-u"])
 
 
-def image_size(args: CommandLineArguments) -> int:
-    size = GPT_HEADER_SIZE + GPT_FOOTER_SIZE
+def remove_files(context: Context) -> None:
+    """Remove files based on user-specified patterns"""
 
-    if args.root_size is not None:
-        size += args.root_size
-    if args.home_size is not None:
-        size += args.home_size
-    if args.srv_size is not None:
-        size += args.srv_size
-    if args.var_size is not None:
-        size += args.var_size
-    if args.tmp_size is not None:
-        size += args.tmp_size
-    if args.bootable:
-        if "uefi" in args.boot_protocols:
-            size += args.esp_size
-        if "bios" in args.boot_protocols:
-            size += BIOS_PARTITION_SIZE
-    if args.xbootldr_size is not None:
-        size += args.xbootldr_size
-    if args.swap_size is not None:
-        size += args.swap_size
-    if args.verity_size is not None:
-        size += args.verity_size
+    if not context.config.remove_files:
+        return
 
-    return size
+    with complete_step("Removing files…"):
+        for pattern in context.config.remove_files:
+            rmtree(*context.root.glob(pattern.lstrip("/")), sandbox=context.sandbox)
 
 
-def disable_cow(path: str) -> None:
-    """Disable copy-on-write if applicable on filesystem"""
+def install_distribution(context: Context) -> None:
+    if context.config.base_trees:
+        if not context.config.packages:
+            return
 
-    run(["chattr", "+C", path], stdout=DEVNULL, stderr=DEVNULL, check=False)
-
-
-def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
-    pn = 1
-    table = "label: gpt\n"
-    if args.gpt_first_lba is not None:
-        table += f"first-lba: {args.gpt_first_lba:d}\n"
-    run_sfdisk = False
-    args.esp_partno = None
-    args.bios_partno = None
-
-    if args.bootable:
-        if "uefi" in args.boot_protocols:
-            table += f'size={args.esp_size // 512}, type={GPT_ESP}, name="ESP System Partition"\n'
-            args.esp_partno = pn
-            pn += 1
-
-        if "bios" in args.boot_protocols:
-            table += f'size={BIOS_PARTITION_SIZE // 512}, type={GPT_BIOS}, name="BIOS Boot Partition"\n'
-            args.bios_partno = pn
-            pn += 1
-
-        run_sfdisk = True
-
-    if args.xbootldr_size is not None:
-        table += f'size={args.xbootldr_size // 512}, type={GPT_XBOOTLDR}, name="Boot Loader Partition"\n'
-        args.xbootldr_partno = pn
-        pn += 1
+        with complete_step(f"Installing extra packages for {str(context.config.distribution).capitalize()}"):
+            context.config.distribution.install_packages(context, context.config.packages)
     else:
-        args.xbootldr_partno = None
+        if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+            if context.config.packages:
+                die("Cannot install packages in extension images without a base tree",
+                    hint="Configure a base tree with the BaseTrees= setting")
+            return
 
-    if args.swap_size is not None:
-        table += f'size={args.swap_size // 512}, type={GPT_SWAP}, name="Swap Partition"\n'
-        args.swap_partno = pn
-        pn += 1
-        run_sfdisk = True
-    else:
-        args.swap_partno = None
+        with complete_step(f"Installing {str(context.config.distribution).capitalize()}"):
+            context.config.distribution.install(context)
 
-    args.home_partno = None
-    args.srv_partno = None
-    args.var_partno = None
-    args.tmp_partno = None
+            if not (context.root / "etc/machine-id").exists():
+                # Uninitialized means we want it to get initialized on first boot.
+                with umask(~0o444):
+                    (context.root / "etc/machine-id").write_text("uninitialized\n")
 
-    if args.output_format != OutputFormat.gpt_btrfs:
-        if args.home_size is not None:
-            table += f'size={args.home_size // 512}, type={GPT_HOME}, name="Home Partition"\n'
-            args.home_partno = pn
-            pn += 1
-            run_sfdisk = True
+            # Ensure /efi exists so that the ESP is mounted there, as recommended by
+            # https://0pointer.net/blog/linux-boot-partitions.html. Use the most restrictive access mode we
+            # can without tripping up mkfs tools since this directory is only meant to be overmounted and
+            # should not be read from or written to.
+            with umask(~0o500):
+                (context.root / "efi").mkdir(exist_ok=True)
 
-        if args.srv_size is not None:
-            table += f'size={args.srv_size // 512}, type={GPT_SRV}, name="Server Data Partition"\n'
-            args.srv_partno = pn
-            pn += 1
-            run_sfdisk = True
+            if context.config.packages:
+                context.config.distribution.install_packages(context, context.config.packages)
 
-        if args.var_size is not None:
-            table += f'size={args.var_size // 512}, type={GPT_VAR}, name="Variable Data Partition"\n'
-            args.var_partno = pn
-            pn += 1
-            run_sfdisk = True
+    for f in ("var/lib/systemd/random-seed",
+              "var/lib/systemd/credential.secret",
+              "etc/machine-info",
+              "var/lib/dbus/machine-id"):
+        # Using missing_ok=True still causes an OSError if the mount is read-only even if the
+        # file doesn't exist so do an explicit exists() check first.
+        if (context.root / f).exists():
+            (context.root / f).unlink()
 
-        if args.tmp_size is not None:
-            table += f'size={args.tmp_size // 512}, type={GPT_TMP}, name="Temporary Data Partition"\n'
-            args.tmp_partno = pn
-            pn += 1
-            run_sfdisk = True
 
-    if not args.generated_root():
-        table += 'type={}, attrs={}, name="Root Partition"\n'.format(
-            gpt_root_native(args.architecture).root,
-            "GUID:60" if args.read_only and args.output_format != OutputFormat.gpt_btrfs else "",
+def install_build_packages(context: Context) -> None:
+    if not context.config.build_scripts or not context.config.build_packages:
+        return
+
+    with (
+        complete_step(f"Installing build packages for {context.config.distribution.pretty_name()}"),
+        mount_build_overlay(context),
+    ):
+        context.config.distribution.install_packages(context, context.config.build_packages)
+
+
+def install_volatile_packages(context: Context) -> None:
+    if not context.config.volatile_packages:
+        return
+
+    with complete_step(f"Installing volatile packages for {context.config.distribution.pretty_name()}"):
+        context.config.distribution.install_packages(context, context.config.volatile_packages)
+
+
+def remove_packages(context: Context) -> None:
+    """Remove packages listed in config.remove_packages"""
+
+    if not context.config.remove_packages:
+        return
+
+    with complete_step(f"Removing {len(context.config.remove_packages)} packages…"):
+        try:
+            context.config.distribution.remove_packages(context, context.config.remove_packages)
+        except NotImplementedError:
+            die(f"Removing packages is not supported for {context.config.distribution}")
+
+
+def check_root_populated(context: Context) -> None:
+    if context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+        return
+
+    """Check that the root was populated by looking for a os-release file."""
+    osrelease = context.root / "usr/lib/os-release"
+    if not osrelease.exists():
+        die(
+            f"{osrelease} not found.",
+            hint=(
+                "The root must be populated by the distribution, or from base trees, "
+                "skeleton trees, and prepare scripts."
+            )
         )
-        run_sfdisk = True
-
-    args.root_partno = pn
-    pn += 1
-
-    if args.verity:
-        args.verity_partno = pn
-        pn += 1
-    else:
-        args.verity_partno = None
-
-    return table, run_sfdisk
 
 
-def create_image(args: CommandLineArguments, root: str, for_cache: bool) -> Optional[BinaryIO]:
-    if not args.output_format.is_disk():
-        return None
+def configure_os_release(context: Context) -> None:
+    """Write IMAGE_ID and IMAGE_VERSION to /usr/lib/os-release in the image."""
+    if not context.config.image_id and not context.config.image_version:
+        return
 
-    with complete_step("Creating partition table", "Created partition table as {.name}") as output:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+        return
 
-        f: BinaryIO = cast(
-            BinaryIO,
-            tempfile.NamedTemporaryFile(prefix=".mkosi-", delete=not for_cache, dir=os.path.dirname(args.output)),
+    for candidate in ["usr/lib/os-release", "usr/lib/initrd-release"]:
+        osrelease = context.root / candidate
+        # at this point we know we will either change or add to the file
+        newosrelease = osrelease.with_suffix(".new")
+
+        if not osrelease.is_file() or osrelease.is_symlink():
+            continue
+
+        image_id_written = image_version_written = False
+        with osrelease.open("r") as old, newosrelease.open("w") as new:
+            # fix existing values
+            for line in old.readlines():
+                if context.config.image_id and line.startswith("IMAGE_ID="):
+                    new.write(f'IMAGE_ID="{context.config.image_id}"\n')
+                    image_id_written = True
+                elif context.config.image_version and line.startswith("IMAGE_VERSION="):
+                    new.write(f'IMAGE_VERSION="{context.config.image_version}"\n')
+                    image_version_written = True
+                else:
+                    new.write(line)
+
+            # append if they were missing
+            if context.config.image_id and not image_id_written:
+                new.write(f'IMAGE_ID="{context.config.image_id}"\n')
+            if context.config.image_version and not image_version_written:
+                new.write(f'IMAGE_VERSION="{context.config.image_version}"\n')
+
+        newosrelease.rename(osrelease)
+
+
+def configure_extension_release(context: Context) -> None:
+    if context.config.output_format not in (OutputFormat.sysext, OutputFormat.confext):
+        return
+
+    prefix = "SYSEXT" if context.config.output_format == OutputFormat.sysext else "CONFEXT"
+    d = "usr/lib" if context.config.output_format == OutputFormat.sysext else "etc"
+    p = context.root / d / f"extension-release.d/extension-release.{context.config.output}"
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    osrelease = read_env_file(q) if (q := context.root / "usr/lib/os-release").exists() else {}
+    extrelease = read_env_file(p) if p.exists() else {}
+    new = p.with_suffix(".new")
+
+    with new.open("w") as f:
+        for k, v in extrelease.items():
+            f.write(f"{k}={v}\n")
+
+        if "ID" not in extrelease:
+            f.write(f"ID={osrelease.get('ID', '_any')}\n")
+
+        if "VERSION_ID" not in extrelease and (version := osrelease.get("VERSION_ID")):
+            f.write(f"VERSION_ID={version}\n")
+
+        if f"{prefix}_ID" not in extrelease and context.config.image_id:
+            f.write(f"{prefix}_ID={context.config.image_id}\n")
+
+        if f"{prefix}_VERSION_ID" not in extrelease and context.config.image_version:
+            f.write(f"{prefix}_VERSION_ID={context.config.image_version}\n")
+
+        if f"{prefix}_SCOPE" not in extrelease:
+            f.write(f"{prefix}_SCOPE=initrd system portable\n")
+
+        if "ARCHITECTURE" not in extrelease:
+            f.write(f"ARCHITECTURE={context.config.architecture}\n")
+
+    new.rename(p)
+
+
+def configure_autologin_service(context: Context, service: str, extra: str) -> None:
+    dropin = context.root / f"usr/lib/systemd/system/{service}.d/autologin.conf"
+    with umask(~0o755):
+        dropin.parent.mkdir(parents=True, exist_ok=True)
+    with umask(~0o644):
+        dropin.write_text(
+            textwrap.dedent(
+                f"""\
+                [Service]
+                ExecStart=
+                ExecStart=-agetty -o '-f -p -- \\\\u' --autologin root {extra} $TERM
+                StandardInput=tty
+                StandardOutput=tty
+                """
+            )
         )
-        output.append(f)
-        disable_cow(f.name)
-        f.truncate(image_size(args))
-
-        table, run_sfdisk = determine_partition_table(args)
-
-        if run_sfdisk:
-            run(["sfdisk", "--color=never", f.name], input=table.encode("utf-8"))
-            run(["sync"])
-
-        args.ran_sfdisk = run_sfdisk
-
-    return f
 
 
-def copy_image_temporary(src: str, dir: str) -> BinaryIO:
-    with open(src, "rb") as source:
-        f: BinaryIO = cast(BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-", dir=dir))
+def configure_autologin(context: Context) -> None:
+    if not context.config.autologin:
+        return
 
-        # So on one hand we want CoW off, since this stuff will
-        # have a lot of random write accesses. On the other we
-        # want the copy to be snappy, hence we do want CoW. Let's
-        # ask for both, and let the kernel figure things out:
-        # let's turn off CoW on the file, but start with a CoW
-        # copy. On btrfs that works: the initial copy is made as
-        # CoW but later changes do not result in CoW anymore.
+    with complete_step("Setting up autologin…"):
+        configure_autologin_service(context, "console-getty.service",
+                                    "--noclear --keep-baud console 115200,38400,9600")
+        configure_autologin_service(context, "getty@tty1.service",
+                                    "--noclear -")
+        configure_autologin_service(context, "serial-getty@ttyS0.service",
+                                    "--keep-baud 115200,57600,38400,9600 -")
 
-        disable_cow(f.name)
-        copy_file_object(source, f)
-
-        return f
-
-
-def copy_file_temporary(src: str, dir: str) -> BinaryIO:
-    with open(src, "rb") as source:
-        f = cast(BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-", dir=dir))
-        copy_file_object(source, f)
-        return f
+        if context.config.architecture.default_serial_tty() != "ttyS0":
+            configure_autologin_service(context,
+                                        f"serial-getty@{context.config.architecture.default_serial_tty()}.service",
+                                        "--keep-baud 115200,57600,38400,9600 -")
 
 
-def reuse_cache_image(
-    args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool
-) -> Tuple[Optional[BinaryIO], bool]:
-    if not args.incremental:
-        return None, False
-    if not args.output_format.is_disk_rw():
-        return None, False
+@contextlib.contextmanager
+def mount_cache_overlay(context: Context, cached: bool) -> Iterator[None]:
+    if not context.config.incremental or not context.config.base_trees or context.config.overlay or cached:
+        yield
+        return
 
-    fname = args.cache_pre_dev if do_run_build_script else args.cache_pre_inst
-    if for_cache:
-        if fname and os.path.exists(fname):
-            # Cache already generated, skip generation, note that manually removing the exising cache images is
-            # necessary if Packages or BuildPackages change
-            return None, True
+    d = context.workspace / "cache-overlay"
+    with umask(~0o755):
+        d.mkdir(exist_ok=True)
+
+    with mount_overlay([context.root], d, context.root):
+        yield
+
+
+@contextlib.contextmanager
+def mount_build_overlay(context: Context, volatile: bool = False) -> Iterator[Path]:
+    d = context.workspace / "build-overlay"
+    if not d.is_symlink():
+        with umask(~0o755):
+            d.mkdir(exist_ok=True)
+
+    with contextlib.ExitStack() as stack:
+        lower = [context.root]
+
+        if volatile:
+            lower += [d]
+            upper = None
         else:
-            return None, False
+            upper = d
 
-    if fname is None:
-        return None, False
+        stack.enter_context(mount_overlay(lower, upper, context.root))
 
-    with complete_step("Basing off cached image " + fname, "Copied cached image as {.name}") as output:
-
-        try:
-            f = copy_image_temporary(src=fname, dir=os.path.dirname(args.output))
-        except FileNotFoundError:
-            return None, False
-
-        output.append(f)
-        _, run_sfdisk = determine_partition_table(args)
-        args.ran_sfdisk = run_sfdisk
-
-    return f, True
+        yield context.root
 
 
 @contextlib.contextmanager
-def attach_image_loopback(args: CommandLineArguments, raw: Optional[BinaryIO]) -> Generator[Optional[str], None, None]:
-    if raw is None:
-        yield None
-        return
-
-    with complete_step("Attaching image file", "Attached image file as {}") as output:
-        c = run(["losetup", "--find", "--show", "--partscan", raw.name], stdout=PIPE)
-        loopdev = c.stdout.decode("utf-8").strip()
-        output.append(loopdev)
-
-    try:
-        yield loopdev
-    finally:
-        with complete_step("Detaching image file"):
-            run(["losetup", "--detach", loopdev])
-
-
-def optional_partition(loopdev: str, partno: Optional[int]) -> Optional[str]:
-    if partno is None:
-        return None
-
-    return partition(loopdev, partno)
-
-
-def partition(loopdev: str, partno: int) -> str:
-    return loopdev + "p" + str(partno)
-
-
-def prepare_swap(args: CommandLineArguments, loopdev: Optional[str], cached: bool) -> None:
-    if loopdev is None:
-        return
-    if cached:
-        return
-    if args.swap_partno is None:
-        return
-
-    with complete_step("Formatting swap partition"):
-        run(["mkswap", "-Lswap", partition(loopdev, args.swap_partno)])
-
-
-def prepare_esp(args: CommandLineArguments, loopdev: Optional[str], cached: bool) -> None:
-    if loopdev is None:
-        return
-    if cached:
-        return
-    if args.esp_partno is None:
-        return
-
-    with complete_step("Formatting ESP partition"):
-        run(["mkfs.fat", "-nEFI", "-F32", partition(loopdev, args.esp_partno)])
-
-
-def prepare_xbootldr(args: CommandLineArguments, loopdev: Optional[str], cached: bool) -> None:
-    if loopdev is None:
-        return
-    if cached:
-        return
-    if args.xbootldr_partno is None:
-        return
-
-    with complete_step("Formatting XBOOTLDR partition"):
-        run(["mkfs.fat", "-nXBOOTLDR", "-F32", partition(loopdev, args.xbootldr_partno)])
-
-
-def mkfs_ext4_cmd(label: str, mount: str) -> List[str]:
-    return ["mkfs.ext4", "-I", "256", "-L", label, "-M", mount]
-
-
-def mkfs_xfs_cmd(label: str) -> List[str]:
-    return ["mkfs.xfs", "-n", "ftype=1", "-L", label]
-
-
-def mkfs_btrfs_cmd(label: str) -> List[str]:
-    return ["mkfs.btrfs", "-L", label, "-d", "single", "-m", "single"]
-
-
-def mkfs_generic(args: CommandLineArguments, label: str, mount: str, dev: str) -> None:
-    cmdline = []
-
-    if args.output_format == OutputFormat.gpt_btrfs:
-        cmdline = mkfs_btrfs_cmd(label)
-    elif args.output_format == OutputFormat.gpt_xfs:
-        cmdline = mkfs_xfs_cmd(label)
-    else:
-        cmdline = mkfs_ext4_cmd(label, mount)
-
-    if args.output_format == OutputFormat.gpt_ext4:
-        if args.distribution in (Distribution.centos, Distribution.centos_epel) and is_older_than_centos8(
-            args.release
-        ):
-            # e2fsprogs in centos7 is too old and doesn't support this feature
-            cmdline += ["-O", "^metadata_csum"]
-
-        if args.architecture in ("x86_64", "aarch64"):
-            # enable 64bit filesystem feature on supported architectures
-            cmdline += ["-O", "64bit"]
-
-    run(cmdline + [dev])
-
-
-def luks_format(dev: str, passphrase: Dict[str, str]) -> None:
-    if passphrase["type"] == "stdin":
-        passphrase_content = (passphrase["content"] + "\n").encode("utf-8")
-        run(
-            [
-                "cryptsetup",
-                "luksFormat",
-                "--force-password",
-                "--pbkdf-memory=64",
-                "--pbkdf-parallel=1",
-                "--pbkdf-force-iterations=1000",
-                "--batch-mode",
-                dev,
-            ],
-            input=passphrase_content,
-        )
-    else:
-        assert passphrase["type"] == "file"
-        run(
-            [
-                "cryptsetup",
-                "luksFormat",
-                "--force-password",
-                "--pbkdf-memory=64",
-                "--pbkdf-parallel=1",
-                "--pbkdf-force-iterations=1000",
-                "--batch-mode",
-                dev,
-                passphrase["content"],
-            ]
-        )
-
-
-def luks_open(dev: str, passphrase: Dict[str, str]) -> str:
-    name = str(uuid.uuid4())
-
-    if passphrase["type"] == "stdin":
-        passphrase_content = (passphrase["content"] + "\n").encode("utf-8")
-        run(["cryptsetup", "open", "--type", "luks", dev, name], input=passphrase_content)
-    else:
-        assert passphrase["type"] == "file"
-        run(["cryptsetup", "--key-file", passphrase["content"], "open", "--type", "luks", dev, name])
-
-    return os.path.join("/dev/mapper", name)
-
-
-def luks_close(dev: Optional[str], text: str) -> None:
-    if dev is None:
-        return
-
-    with complete_step(text):
-        run(["cryptsetup", "close", dev])
-
-
-def luks_format_root(
-    args: CommandLineArguments,
-    loopdev: str,
-    do_run_build_script: bool,
-    cached: bool,
-    inserting_generated_root: bool = False,
-) -> None:
-    if args.encrypt != "all":
-        return
-    if args.root_partno is None:
-        return
-    if args.generated_root() and not inserting_generated_root:
-        return
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    with complete_step("LUKS formatting root partition"):
-        luks_format(partition(loopdev, args.root_partno), args.passphrase)
-
-
-def luks_format_home(args: CommandLineArguments, loopdev: str, do_run_build_script: bool, cached: bool) -> None:
-    if args.encrypt is None:
-        return
-    if args.home_partno is None:
-        return
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    with complete_step("LUKS formatting home partition"):
-        luks_format(partition(loopdev, args.home_partno), args.passphrase)
-
-
-def luks_format_srv(args: CommandLineArguments, loopdev: str, do_run_build_script: bool, cached: bool) -> None:
-    if args.encrypt is None:
-        return
-    if args.srv_partno is None:
-        return
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    with complete_step("LUKS formatting server data partition"):
-        luks_format(partition(loopdev, args.srv_partno), args.passphrase)
-
-
-def luks_format_var(args: CommandLineArguments, loopdev: str, do_run_build_script: bool, cached: bool) -> None:
-    if args.encrypt is None:
-        return
-    if args.var_partno is None:
-        return
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    with complete_step("LUKS formatting variable data partition"):
-        luks_format(partition(loopdev, args.var_partno), args.passphrase)
-
-
-def luks_format_tmp(args: CommandLineArguments, loopdev: str, do_run_build_script: bool, cached: bool) -> None:
-    if args.encrypt is None:
-        return
-    if args.tmp_partno is None:
-        return
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    with complete_step("LUKS formatting temporary data partition"):
-        luks_format(partition(loopdev, args.tmp_partno), args.passphrase)
-
-
-def luks_setup_root(
-    args: CommandLineArguments, loopdev: str, do_run_build_script: bool, inserting_generated_root: bool = False
-) -> Optional[str]:
-    if args.encrypt != "all":
-        return None
-    if args.root_partno is None:
-        return None
-    if args.generated_root() and not inserting_generated_root:
-        return None
-    if do_run_build_script:
-        return None
-
-    with complete_step("Opening LUKS root partition"):
-        return luks_open(partition(loopdev, args.root_partno), args.passphrase)
-
-
-def luks_setup_home(args: CommandLineArguments, loopdev: str, do_run_build_script: bool) -> Optional[str]:
-    if args.encrypt is None:
-        return None
-    if args.home_partno is None:
-        return None
-    if do_run_build_script:
-        return None
-
-    with complete_step("Opening LUKS home partition"):
-        return luks_open(partition(loopdev, args.home_partno), args.passphrase)
-
-
-def luks_setup_srv(args: CommandLineArguments, loopdev: str, do_run_build_script: bool) -> Optional[str]:
-    if args.encrypt is None:
-        return None
-    if args.srv_partno is None:
-        return None
-    if do_run_build_script:
-        return None
-
-    with complete_step("Opening LUKS server data partition"):
-        return luks_open(partition(loopdev, args.srv_partno), args.passphrase)
-
-
-def luks_setup_var(args: CommandLineArguments, loopdev: str, do_run_build_script: bool) -> Optional[str]:
-    if args.encrypt is None:
-        return None
-    if args.var_partno is None:
-        return None
-    if do_run_build_script:
-        return None
-
-    with complete_step("Opening LUKS variable data partition"):
-        return luks_open(partition(loopdev, args.var_partno), args.passphrase)
-
-
-def luks_setup_tmp(args: CommandLineArguments, loopdev: str, do_run_build_script: bool) -> Optional[str]:
-    if args.encrypt is None:
-        return None
-    if args.tmp_partno is None:
-        return None
-    if do_run_build_script:
-        return None
-
-    with complete_step("Opening LUKS temporary data partition"):
-        return luks_open(partition(loopdev, args.tmp_partno), args.passphrase)
-
-
-@contextlib.contextmanager
-def luks_setup_all(
-    args: CommandLineArguments, loopdev: Optional[str], do_run_build_script: bool
-) -> Generator[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], None, None]:
-    if not args.output_format.is_disk():
-        yield (None, None, None, None, None)
-        return
-    assert loopdev is not None
-
-    try:
-        root = luks_setup_root(args, loopdev, do_run_build_script)
-        try:
-            home = luks_setup_home(args, loopdev, do_run_build_script)
-            try:
-                srv = luks_setup_srv(args, loopdev, do_run_build_script)
-                try:
-                    var = luks_setup_var(args, loopdev, do_run_build_script)
-                    try:
-                        tmp = luks_setup_tmp(args, loopdev, do_run_build_script)
-
-                        yield (
-                            optional_partition(loopdev, args.root_partno) if root is None else root,
-                            optional_partition(loopdev, args.home_partno) if home is None else home,
-                            optional_partition(loopdev, args.srv_partno) if srv is None else srv,
-                            optional_partition(loopdev, args.var_partno) if var is None else var,
-                            optional_partition(loopdev, args.tmp_partno) if tmp is None else tmp,
+def finalize_scripts(config: Config, scripts: Mapping[str, Sequence[PathString]]) -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="mkosi-scripts-") as d:
+        # Make sure than when mkosi-as-caller is used the scripts can still be accessed.
+        os.chmod(d, 0o755)
+
+        for name, script in scripts.items():
+            # Make sure we don't end up in a recursive loop when we name a script after the binary it execs
+            # by removing the scripts directory from the PATH when we execute a script.
+            with (Path(d) / name).open("w") as f:
+                f.write("#!/bin/sh\n")
+
+                if config.find_binary(name):
+                    f.write(
+                        textwrap.dedent(
+                            """\
+                            DIR="$(cd "$(dirname "$0")" && pwd)"
+                            PATH="$(echo "$PATH" | tr ':' '\\n' | grep -v "$DIR" | tr '\\n' ':')"
+                            export PATH
+                            """
                         )
-                    finally:
-                        luks_close(tmp, "Closing LUKS temporary data partition")
-                finally:
-                    luks_close(var, "Closing LUKS variable data partition")
-            finally:
-                luks_close(srv, "Closing LUKS server data partition")
-        finally:
-            luks_close(home, "Closing LUKS home partition")
-    finally:
-        luks_close(root, "Closing LUKS root partition")
+                    )
+
+                f.write(f'exec {shlex.join(str(s) for s in script)} "$@"\n')
+
+            make_executable(Path(d) / name)
+            os.chmod(Path(d) / name, 0o755)
+            os.utime(Path(d) / name, (0, 0))
+
+        yield Path(d)
 
 
-def prepare_root(args: CommandLineArguments, dev: Optional[str], cached: bool) -> None:
-    if dev is None:
+GIT_ENV = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "*",
+}
+
+
+def mkosi_as_caller() -> tuple[str, ...]:
+    return (
+        "setpriv",
+        f"--reuid={INVOKING_USER.uid}",
+        f"--regid={INVOKING_USER.gid}",
+        "--clear-groups",
+    )
+
+
+def finalize_host_scripts(
+    context: Context,
+    helpers: Mapping[str, Sequence[PathString]] = {},
+) -> AbstractContextManager[Path]:
+    scripts: dict[str, Sequence[PathString]] = {}
+    for binary in ("useradd", "groupadd"):
+        if context.config.find_binary(binary):
+            scripts[binary] = (binary, "--root", "/buildroot")
+    return finalize_scripts(context.config, scripts | dict(helpers))
+
+
+@contextlib.contextmanager
+def finalize_config_json(config: Config) -> Iterator[Path]:
+    with tempfile.NamedTemporaryFile(mode="w") as f:
+        f.write(config.to_json())
+        f.flush()
+        yield Path(f.name)
+
+
+def run_configure_scripts(config: Config) -> Config:
+    if not config.configure_scripts:
+        return config
+
+    for script in config.configure_scripts:
+        if not os.access(script, os.X_OK):
+            die(f"{script} is not executable")
+
+    env = dict(
+        DISTRIBUTION=str(config.distribution),
+        RELEASE=config.release,
+        ARCHITECTURE=str(config.architecture),
+        QEMU_ARCHITECTURE=config.architecture.to_qemu(),
+        SRCDIR="/work/src",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+    )
+
+    if config.profile:
+        env["PROFILE"] = config.profile
+
+    with finalize_source_mounts(config, ephemeral=False) as sources:
+        for script in config.configure_scripts:
+            with complete_step(f"Running configure script {script}…"):
+                result = run(
+                    ["/work/configure"],
+                    env=env | config.environment,
+                    sandbox=config.sandbox(
+                        binary=None,
+                        mounts=[*sources, Mount(script, "/work/configure", ro=True)],
+                        options=["--dir", "/work/src", "--chdir", "/work/src"]
+                    ),
+                    input=config.to_json(indent=None),
+                    stdout=subprocess.PIPE,
+                )
+
+                config = Config.from_json(result.stdout)
+
+    return config
+
+
+def run_sync_scripts(context: Context) -> None:
+    if not context.config.sync_scripts:
         return
-    if args.generated_root():
+
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        SRCDIR="/work/src",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+        CACHED=one_zero(have_cache(context.config)),
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    # We make sure to mount everything in to make ssh work since syncing might involve git which could invoke ssh.
+    if agent := os.getenv("SSH_AUTH_SOCK"):
+        env["SSH_AUTH_SOCK"] = agent
+
+    with (
+        finalize_source_mounts(context.config, ephemeral=False) as sources,
+        finalize_config_json(context.config) as json,
+    ):
+        for script in context.config.sync_scripts:
+            mounts = [
+                *sources,
+                *finalize_crypto_mounts(context.config),
+                Mount(script, "/work/sync", ro=True),
+                Mount(json, "/work/config.json", ro=True),
+            ]
+
+            if (p := INVOKING_USER.home()).exists() and p != Path("/"):
+                # We use a writable mount here to keep git worktrees working which encode absolute paths to the parent
+                # git repository and might need to modify the git config in the parent git repository when submodules
+                # are in use as well.
+                mounts += [Mount(p, p)]
+                env["HOME"] = os.fspath(p)
+            if (p := Path(f"/run/user/{INVOKING_USER.uid}")).exists():
+                mounts += [Mount(p, p, ro=True)]
+
+            with complete_step(f"Running sync script {script}…"):
+                run(
+                    ["/work/sync", "final"],
+                    env=env | context.config.environment,
+                    stdin=sys.stdin,
+                    sandbox=context.sandbox(
+                        binary=None,
+                        network=True,
+                        mounts=mounts,
+                        options=["--dir", "/work/src", "--chdir", "/work/src"]
+                    ),
+                )
+
+
+def run_prepare_scripts(context: Context, build: bool) -> None:
+    if not context.config.prepare_scripts:
         return
-    if cached:
+    if build and not context.config.build_scripts:
         return
 
-    with complete_step("Formatting root partition"):
-        mkfs_generic(args, "root", "/", dev)
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        BUILDROOT="/buildroot",
+        SRCDIR="/work/src",
+        CHROOT_SRCDIR="/work/src",
+        PACKAGEDIR="/work/packages",
+        ARTIFACTDIR="/work/artifacts",
+        SCRIPT="/work/prepare",
+        CHROOT_SCRIPT="/work/prepare",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+        WITH_DOCS=one_zero(context.config.with_docs),
+        WITH_NETWORK=one_zero(context.config.with_network),
+        WITH_TESTS=one_zero(context.config.with_tests),
+        **GIT_ENV,
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    with (
+        mount_build_overlay(context) if build else contextlib.nullcontext(),
+        finalize_source_mounts(context.config, ephemeral=context.config.build_sources_ephemeral) as sources,
+    ):
+        if build:
+            step_msg = "Running prepare script {} in build overlay…"
+            arg = "build"
+        else:
+            step_msg = "Running prepare script {}…"
+            arg = "final"
+
+        for script in context.config.prepare_scripts:
+            chroot = chroot_cmd(resolve=True, work=True)
+
+            helpers = {
+                "mkosi-chroot": chroot,
+                "mkosi-as-caller": mkosi_as_caller(),
+                **context.config.distribution.package_manager(context.config).scripts(context),
+            }
+
+            with (
+                finalize_host_scripts(context, helpers) as hd,
+                finalize_config_json(context.config) as json,
+                complete_step(step_msg.format(script)),
+            ):
+                run(
+                    ["/work/prepare", arg],
+                    env=env | context.config.environment,
+                    stdin=sys.stdin,
+                    sandbox=context.sandbox(
+                        binary=None,
+                        network=True,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/prepare", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
+                            Mount(context.root, "/buildroot"),
+                            Mount(context.artifacts, "/work/artifacts"),
+                            *context.config.distribution.package_manager(context.config).mounts(context),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src"],
+                        scripts=hd,
+                        extra=chroot if script.suffix == ".chroot" else [],
+                    )
+                )
 
 
-def prepare_home(args: CommandLineArguments, dev: Optional[str], cached: bool) -> None:
-    if dev is None:
+def run_build_scripts(context: Context) -> None:
+    if not context.config.build_scripts:
         return
-    if cached:
+
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        BUILDROOT="/buildroot",
+        DESTDIR="/work/dest",
+        CHROOT_DESTDIR="/work/dest",
+        OUTPUTDIR="/work/out",
+        CHROOT_OUTPUTDIR="/work/out",
+        SRCDIR="/work/src",
+        CHROOT_SRCDIR="/work/src",
+        PACKAGEDIR="/work/packages",
+        ARTIFACTDIR="/work/artifacts",
+        SCRIPT="/work/build-script",
+        CHROOT_SCRIPT="/work/build-script",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+        WITH_DOCS=one_zero(context.config.with_docs),
+        WITH_NETWORK=one_zero(context.config.with_network),
+        WITH_TESTS=one_zero(context.config.with_tests),
+        **GIT_ENV,
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    if context.config.build_dir is not None:
+        env |= dict(
+            BUILDDIR="/work/build",
+            CHROOT_BUILDDIR="/work/build",
+        )
+
+    with (
+        mount_build_overlay(context, volatile=True),
+        finalize_source_mounts(context.config, ephemeral=context.config.build_sources_ephemeral) as sources,
+    ):
+        for script in context.config.build_scripts:
+            chroot = chroot_cmd(resolve=context.config.with_network, work=True)
+
+            helpers = {
+                "mkosi-chroot": chroot,
+                "mkosi-as-caller": mkosi_as_caller(),
+                **context.config.distribution.package_manager(context.config).scripts(context),
+            }
+
+            cmdline = context.args.cmdline if context.args.verb == Verb.build else []
+
+            with (
+                finalize_host_scripts(context, helpers) as hd,
+                finalize_config_json(context.config) as json,
+                complete_step(f"Running build script {script}…"),
+            ):
+                run(
+                    ["/work/build-script", *cmdline],
+                    env=env | context.config.environment,
+                    stdin=sys.stdin,
+                    sandbox=context.sandbox(
+                        binary=None,
+                        network=context.config.with_network,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/build-script", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
+                            Mount(context.root, "/buildroot"),
+                            Mount(context.install_dir, "/work/dest"),
+                            Mount(context.staging, "/work/out"),
+                            Mount(context.artifacts, "/work/artifacts"),
+                            *(
+                                [Mount(context.config.build_dir, "/work/build")]
+                                if context.config.build_dir
+                                else []
+                            ),
+                            *context.config.distribution.package_manager(context.config).mounts(context),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src"],
+                        scripts=hd,
+                        extra=chroot if script.suffix == ".chroot" else [],
+                    ),
+                )
+
+    if context.want_local_repo() and context.config.output_format != OutputFormat.none:
+        with complete_step("Rebuilding local package repository"):
+            context.config.distribution.createrepo(context)
+
+
+def run_postinst_scripts(context: Context) -> None:
+    if not context.config.postinst_scripts:
         return
 
-    with complete_step("Formatting home partition"):
-        mkfs_generic(args, "home", "/home", dev)
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        BUILDROOT="/buildroot",
+        OUTPUTDIR="/work/out",
+        CHROOT_OUTPUTDIR="/work/out",
+        SCRIPT="/work/postinst",
+        CHROOT_SCRIPT="/work/postinst",
+        SRCDIR="/work/src",
+        CHROOT_SRCDIR="/work/src",
+        PACKAGEDIR="/work/packages",
+        ARTIFACTDIR="/work/artifacts",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+        WITH_NETWORK=one_zero(context.config.with_network),
+        **GIT_ENV,
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    with (
+        finalize_source_mounts(context.config, ephemeral=context.config.build_sources_ephemeral) as sources,
+    ):
+        for script in context.config.postinst_scripts:
+            chroot = chroot_cmd(resolve=context.config.with_network, work=True)
+
+            helpers = {
+                "mkosi-chroot": chroot,
+                "mkosi-as-caller": mkosi_as_caller(),
+                **context.config.distribution.package_manager(context.config).scripts(context),
+            }
+
+            with (
+                finalize_host_scripts(context, helpers) as hd,
+                finalize_config_json(context.config) as json,
+                complete_step(f"Running postinstall script {script}…"),
+            ):
+                run(
+                    ["/work/postinst", "final"],
+                    env=env | context.config.environment,
+                    stdin=sys.stdin,
+                    sandbox=context.sandbox(
+                        binary=None,
+                        network=context.config.with_network,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/postinst", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
+                            Mount(context.root, "/buildroot"),
+                            Mount(context.staging, "/work/out"),
+                            Mount(context.artifacts, "/work/artifacts"),
+                            *context.config.distribution.package_manager(context.config).mounts(context),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src"],
+                        scripts=hd,
+                        extra=chroot if script.suffix == ".chroot" else [],
+                    ),
+                )
 
 
-def prepare_srv(args: CommandLineArguments, dev: Optional[str], cached: bool) -> None:
-    if dev is None:
+def run_finalize_scripts(context: Context) -> None:
+    if not context.config.finalize_scripts:
         return
-    if cached:
+
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        BUILDROOT="/buildroot",
+        OUTPUTDIR="/work/out",
+        CHROOT_OUTPUTDIR="/work/out",
+        SRCDIR="/work/src",
+        CHROOT_SRCDIR="/work/src",
+        PACKAGEDIR="/work/packages",
+        ARTIFACTDIR="/work/artifacts",
+        SCRIPT="/work/finalize",
+        CHROOT_SCRIPT="/work/finalize",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+        WITH_NETWORK=one_zero(context.config.with_network),
+        **GIT_ENV,
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    with finalize_source_mounts(context.config, ephemeral=context.config.build_sources_ephemeral) as sources:
+        for script in context.config.finalize_scripts:
+            chroot = chroot_cmd(resolve=context.config.with_network, work=True)
+
+            helpers = {
+                "mkosi-chroot": chroot,
+                "mkosi-as-caller": mkosi_as_caller(),
+                **context.config.distribution.package_manager(context.config).scripts(context),
+            }
+
+            with (
+                finalize_host_scripts(context, helpers) as hd,
+                finalize_config_json(context.config) as json,
+                complete_step(f"Running finalize script {script}…"),
+            ):
+                run(
+                    ["/work/finalize"],
+                    env=env | context.config.environment,
+                    stdin=sys.stdin,
+                    sandbox=context.sandbox(
+                        binary=None,
+                        network=context.config.with_network,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/finalize", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
+                            Mount(context.root, "/buildroot"),
+                            Mount(context.staging, "/work/out"),
+                            Mount(context.artifacts, "/work/artifacts"),
+                            *context.config.distribution.package_manager(context.config).mounts(context),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src"],
+                        scripts=hd,
+                        extra=chroot if script.suffix == ".chroot" else [],
+                    ),
+                )
+
+
+def certificate_common_name(context: Context, certificate: Path) -> str:
+    output = run(
+        [
+            "openssl",
+            "x509",
+            "-noout",
+            "-subject",
+            "-nameopt", "multiline",
+            "-in", certificate,
+        ],
+        stdout=subprocess.PIPE,
+        sandbox=context.sandbox(binary="openssl", mounts=[Mount(certificate, certificate, ro=True)]),
+    ).stdout
+
+    for line in output.splitlines():
+        if not line.strip().startswith("commonName"):
+            continue
+
+        _, sep, value = line.partition("=")
+        if not sep:
+            die("Missing '=' delimiter in openssl output")
+
+        return value.strip()
+
+    die(f"Certificate {certificate} is missing Common Name")
+
+
+def pesign_prepare(context: Context) -> None:
+    assert context.config.secure_boot_key
+    assert context.config.secure_boot_certificate
+
+    if (context.workspace / "pesign").exists():
         return
 
-    with complete_step("Formatting server data partition"):
-        mkfs_generic(args, "srv", "/srv", dev)
+    (context.workspace / "pesign").mkdir()
+
+    # pesign takes a certificate directory and a certificate common name as input arguments, so we have
+    # to transform our input key and cert into that format. Adapted from
+    # https://www.mankier.com/1/pesign#Examples-Signing_with_the_certificate_and_private_key_in_individual_files
+    with open(context.workspace / "secure-boot.p12", "wb") as f:
+        run(
+            [
+                "openssl",
+                "pkcs12",
+                "-export",
+                # Arcane incantation to create a pkcs12 certificate without a password.
+                "-keypbe", "NONE",
+                "-certpbe", "NONE",
+                "-nomaciter",
+                "-passout", "pass:",
+                "-inkey", context.config.secure_boot_key,
+                "-in", context.config.secure_boot_certificate,
+            ],
+            stdout=f,
+            sandbox=context.sandbox(
+                binary="openssl",
+                mounts=[
+                    Mount(context.config.secure_boot_key, context.config.secure_boot_key, ro=True),
+                    Mount(context.config.secure_boot_certificate, context.config.secure_boot_certificate, ro=True),
+                ],
+            ),
+        )
+
+    (context.workspace / "pesign").mkdir(exist_ok=True)
+
+    run(
+        [
+            "pk12util",
+            "-K", "",
+            "-W", "",
+            "-i", context.workspace / "secure-boot.p12",
+            "-d", context.workspace / "pesign",
+        ],
+        sandbox=context.sandbox(
+            binary="pk12util",
+            mounts=[
+                Mount(context.workspace / "secure-boot.p12", context.workspace / "secure-boot.p12", ro=True),
+                Mount(context.workspace / "pesign", context.workspace / "pesign"),
+            ],
+        ),
+    )
 
 
-def prepare_var(args: CommandLineArguments, dev: Optional[str], cached: bool) -> None:
-    if dev is None:
-        return
-    if cached:
-        return
-
-    with complete_step("Formatting variable data partition"):
-        mkfs_generic(args, "var", "/var", dev)
+def efi_boot_binary(context: Context) -> Path:
+    arch = context.config.architecture.to_efi()
+    assert arch
+    return Path(f"efi/EFI/BOOT/BOOT{arch.upper()}.EFI")
 
 
-def prepare_tmp(args: CommandLineArguments, dev: Optional[str], cached: bool) -> None:
-    if dev is None:
-        return
-    if cached:
-        return
+def shim_second_stage_binary(context: Context) -> Path:
+    arch = context.config.architecture.to_efi()
+    assert arch
+    if context.config.distribution == Distribution.opensuse:
+        return Path("efi/EFI/BOOT/grub.EFI")
+    else:
+        return Path(f"efi/EFI/BOOT/grub{arch}.EFI")
 
-    with complete_step("Formatting temporary data partition"):
-        mkfs_generic(args, "tmp", "/var/tmp", dev)
 
-
-def mount_loop(args: CommandLineArguments, dev: str, where: str, read_only: bool = False) -> None:
-    os.makedirs(where, 0o755, True)
-
-    options = []
-    if not args.output_format.is_squashfs():
-        options.append("discard")
+def sign_efi_binary(context: Context, input: Path, output: Path) -> Path:
+    assert context.config.secure_boot_key
+    assert context.config.secure_boot_certificate
 
     if (
-        args.compress
-        and args.output_format == OutputFormat.gpt_btrfs
-        and not (where.endswith("/efi") or where.endswith("/boot"))
+        context.config.secure_boot_sign_tool == SecureBootSignTool.sbsign or
+        context.config.secure_boot_sign_tool == SecureBootSignTool.auto and
+        context.config.find_binary("sbsign") is not None
     ):
-        if isinstance(args.compress, bool):
-            options.append("compress")
-        else:
-            options.append(f"compress={args.compress}")
-
-    if read_only:
-        options.append("ro")
-
-    cmd = ["mount", "-n", dev, where]
-    if options:
-        cmd += ["-o", ",".join(options)]
-
-    run(cmd)
-
-
-def mount_bind(what: str, where: str) -> str:
-    os.makedirs(what, 0o755, True)
-    os.makedirs(where, 0o755, True)
-    run(["mount", "--bind", what, where])
-    return where
-
-
-def mount_tmpfs(where: str) -> None:
-    os.makedirs(where, 0o755, True)
-    run(["mount", "tmpfs", "-t", "tmpfs", where])
-
-
-@contextlib.contextmanager
-def mount_image(
-    args: CommandLineArguments,
-    root: str,
-    loopdev: Optional[str],
-    root_dev: Optional[str],
-    home_dev: Optional[str],
-    srv_dev: Optional[str],
-    var_dev: Optional[str],
-    tmp_dev: Optional[str],
-    root_read_only: bool = False,
-) -> Generator[None, None, None]:
-    with complete_step("Mounting image"):
-
-        if root_dev is not None:
-            mount_loop(args, root_dev, root, root_read_only)
-        else:
-            # always have a root of the tree as a mount point so we can
-            # recursively unmount anything that ends up mounted there
-            mount_bind(root, root)
-
-        if home_dev is not None:
-            mount_loop(args, home_dev, os.path.join(root, "home"))
-
-        if srv_dev is not None:
-            mount_loop(args, srv_dev, os.path.join(root, "srv"))
-
-        if var_dev is not None:
-            mount_loop(args, var_dev, os.path.join(root, "var"))
-
-        if tmp_dev is not None:
-            mount_loop(args, tmp_dev, os.path.join(root, "var/tmp"))
-
-        if args.esp_partno is not None and loopdev is not None:
-            mount_loop(args, partition(loopdev, args.esp_partno), os.path.join(root, "efi"))
-
-        if args.xbootldr_partno is not None and loopdev is not None:
-            mount_loop(args, partition(loopdev, args.xbootldr_partno), os.path.join(root, "boot"))
-
-        # Make sure /tmp and /run are not part of the image
-        mount_tmpfs(os.path.join(root, "run"))
-        mount_tmpfs(os.path.join(root, "tmp"))
-
-    try:
-        yield
-    finally:
-        with complete_step("Unmounting image"):
-            umount(root)
-
-
-def install_etc_hostname(args: CommandLineArguments, root: str, cached: bool) -> None:
-    if cached:
-        return
-
-    etc_hostname = os.path.join(root, "etc/hostname")
-
-    # Always unlink first, so that we don't get in trouble due to a
-    # symlink or suchlike. Also if no hostname is configured we really
-    # don't want the file to exist, so that systemd's implicit
-    # hostname logic can take effect.
-    try:
-        os.unlink(etc_hostname)
-    except FileNotFoundError:
-        pass
-
-    if args.hostname:
-        with complete_step("Assigning hostname"):
-            open(etc_hostname, "w").write(args.hostname + "\n")
-
-
-@contextlib.contextmanager
-def mount_api_vfs(args: CommandLineArguments, root: str) -> Generator[None, None, None]:
-    paths = ("/proc", "/dev", "/sys")
-
-    with complete_step("Mounting API VFS"):
-        for d in paths:
-            mount_bind(d, root + d)
-    try:
-        yield
-    finally:
-        with complete_step("Unmounting API VFS"):
-            for d in paths:
-                umount(root + d)
-
-
-@contextlib.contextmanager
-def mount_cache(args: CommandLineArguments, root: str) -> Generator[None, None, None]:
-    if args.cache_path is None:
-        yield
-        return
-
-    caches = []
-
-    # We can't do this in mount_image() yet, as /var itself might have to be created as a subvolume first
-    with complete_step("Mounting Package Cache"):
-        if args.distribution in (Distribution.fedora, Distribution.mageia, Distribution.openmandriva):
-            caches = [mount_bind(args.cache_path, os.path.join(root, "var/cache/dnf"))]
-        elif args.distribution in (Distribution.centos, Distribution.centos_epel):
-            # We mount both the YUM and the DNF cache in this case, as
-            # YUM might just be redirected to DNF even if we invoke
-            # the former
-            caches = [
-                mount_bind(os.path.join(args.cache_path, "yum"), os.path.join(root, "var/cache/yum")),
-                mount_bind(os.path.join(args.cache_path, "dnf"), os.path.join(root, "var/cache/dnf")),
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=output.name) as f:
+            os.chmod(f.name, stat.S_IMODE(input.stat().st_mode))
+            cmd: list[PathString] = [
+                "sbsign",
+                "--key", context.config.secure_boot_key,
+                "--cert", context.config.secure_boot_certificate,
+                "--output", "/dev/stdout",
             ]
-        elif args.distribution in (Distribution.debian, Distribution.ubuntu):
-            caches = [mount_bind(args.cache_path, os.path.join(root, "var/cache/apt/archives"))]
-        elif args.distribution == Distribution.arch:
-            caches = [mount_bind(args.cache_path, os.path.join(root, "var/cache/pacman/pkg"))]
-        elif args.distribution == Distribution.opensuse:
-            caches = [mount_bind(args.cache_path, os.path.join(root, "var/cache/zypp/packages"))]
-        elif args.distribution == Distribution.photon:
-            caches = [mount_bind(os.path.join(args.cache_path, "tdnf"), os.path.join(root, "var/cache/tdnf"))]
-    try:
-        yield
-    finally:
-        with complete_step("Unmounting Package Cache"):
-            for d in caches:  # NOQA: E501
-                umount(d)
-
-
-def umount(where: str) -> None:
-    run(["umount", "--recursive", "-n", where])
-
-
-def configure_dracut(args: CommandLineArguments, root: str) -> None:
-    dracut_dir = os.path.join(root, "etc/dracut.conf.d")
-    os.mkdir(dracut_dir, 0o755)
-
-    with open(os.path.join(dracut_dir, "30-mkosi-hostonly.conf"), "w") as f:
-        f.write(f"hostonly={'yes' if args.hostonly_initrd else 'no'}\n")
-
-    with open(os.path.join(dracut_dir, "30-mkosi-systemd-extras.conf"), "w") as f:
-        for extra in DRACUT_SYSTEMD_EXTRAS:
-            f.write(f'install_optional_items+=" {extra} "\n')
-
-    with open(os.path.join(dracut_dir, "30-mkosi-qemu.conf"), "w") as f:
-        f.write('add_dracutmodules+=" qemu "\n')
-
-    if args.hostonly_initrd:
-        with open(os.path.join(dracut_dir, "30-mkosi-filesystem.conf"), "w") as f:
-            f.write(f'filesystems+=" {(args.output_format.needed_kernel_module())} "\n')
-
-    # These distros need uefi_stub configured explicitly for dracut to find the systemd-boot uefi stub.
-    if args.esp_partno is not None and args.distribution in (
-        Distribution.ubuntu,
-        Distribution.debian,
-        Distribution.mageia,
-        Distribution.openmandriva,
+            mounts = [
+                Mount(context.config.secure_boot_certificate, context.config.secure_boot_certificate, ro=True),
+                Mount(input, input, ro=True),
+            ]
+            if context.config.secure_boot_key_source.type == KeySource.Type.engine:
+                cmd += ["--engine", context.config.secure_boot_key_source.source]
+            if context.config.secure_boot_key.exists():
+                mounts += [Mount(context.config.secure_boot_key, context.config.secure_boot_key, ro=True)]
+            cmd += [input]
+            run(
+                cmd,
+                stdout=f,
+                sandbox=context.sandbox(
+                    binary="sbsign",
+                    mounts=mounts,
+                    devices=context.config.secure_boot_key_source.type != KeySource.Type.file,
+                )
+            )
+            output.unlink(missing_ok=True)
+            os.link(f.name, output)
+    elif (
+        context.config.secure_boot_sign_tool == SecureBootSignTool.pesign or
+        context.config.secure_boot_sign_tool == SecureBootSignTool.auto and
+        context.config.find_binary("pesign") is not None
     ):
-        with open(os.path.join(dracut_dir, "30-mkosi-uefi-stub.conf"), "w") as f:
-            f.write("uefi_stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub\n")
-
-    # efivarfs must be present in order to GPT root discovery work
-    if args.esp_partno is not None:
-        with open(os.path.join(dracut_dir, "30-mkosi-efivarfs.conf"), "w") as f:
-            f.write('add_drivers+=" efivarfs "\n')
-
-
-def prepare_tree_root(args: CommandLineArguments, root: str) -> None:
-    if args.output_format == OutputFormat.subvolume:
-        with complete_step("Setting up OS tree root"):
-            btrfs_subvol_create(root)
-
-
-def prepare_tree(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    if cached:
-        return
-
-    with complete_step("Setting up basic OS tree"):
-        if args.output_format is OutputFormat.subvolume or (
-            args.output_format is OutputFormat.gpt_btrfs and not args.minimize
-        ):
-            btrfs_subvol_create(os.path.join(root, "home"))
-            btrfs_subvol_create(os.path.join(root, "srv"))
-            btrfs_subvol_create(os.path.join(root, "var"))
-            btrfs_subvol_create(os.path.join(root, "var/tmp"), 0o1777)
-            os.mkdir(os.path.join(root, "var/lib"))
-            btrfs_subvol_create(os.path.join(root, "var/lib/machines"), 0o700)
-
-        # We need an initialized machine ID for the build & boot logic to work
-        os.mkdir(os.path.join(root, "etc"), 0o755)
-        with open(os.path.join(root, "etc/machine-id"), "w") as f:
-            f.write(args.machine_id)
-            f.write("\n")
-
-        if not do_run_build_script and args.bootable:
-            if args.xbootldr_partno is not None:
-                # Create directories for kernels and entries if this is enabled
-                os.mkdir(os.path.join(root, "boot/EFI"), 0o700)
-                os.mkdir(os.path.join(root, "boot/EFI/Linux"), 0o700)
-                os.mkdir(os.path.join(root, "boot/loader"), 0o700)
-                os.mkdir(os.path.join(root, "boot/loader/entries"), 0o700)
-                os.mkdir(os.path.join(root, "boot", args.machine_id), 0o700)
-            else:
-                # If this is not enabled, let's create an empty directory on /boot
-                os.mkdir(os.path.join(root, "boot"), 0o700)
-
-            if args.esp_partno is not None:
-                os.mkdir(os.path.join(root, "efi/EFI"), 0o700)
-                os.mkdir(os.path.join(root, "efi/EFI/BOOT"), 0o700)
-                os.mkdir(os.path.join(root, "efi/EFI/systemd"), 0o700)
-                os.mkdir(os.path.join(root, "efi/loader"), 0o700)
-
-                if args.xbootldr_partno is None:
-                    # Create directories for kernels and entries, unless the XBOOTLDR partition is turned on
-                    os.mkdir(os.path.join(root, "efi/EFI/Linux"), 0o700)
-                    os.mkdir(os.path.join(root, "efi/loader/entries"), 0o700)
-                    os.mkdir(os.path.join(root, "efi", args.machine_id), 0o700)
-
-                    # Create some compatibility symlinks in /boot in case that is not set up otherwise
-                    os.symlink("../efi", os.path.join(root, "boot/efi"))
-                    os.symlink("../efi/loader", os.path.join(root, "boot/loader"))
-                    os.symlink("../efi/" + args.machine_id, os.path.join(root, "boot", args.machine_id))
-
-            os.mkdir(os.path.join(root, "etc/kernel"), 0o755)
-
-            with open(os.path.join(root, "etc/kernel/cmdline"), "w") as cmdline:
-                cmdline.write(" ".join(args.kernel_command_line))
-                cmdline.write("\n")
-
-        if do_run_build_script or args.ssh:
-            os.mkdir(os.path.join(root, "root"), 0o750)
-
-        if args.ssh and not do_run_build_script:
-            os.mkdir(os.path.join(root, "root/.ssh"), 0o700)
-
-        if do_run_build_script:
-            os.mkdir(os.path.join(root, "root/dest"), 0o755)
-
-            if args.include_dir is not None:
-                os.mkdir(os.path.join(root, "usr"), 0o755)
-                os.mkdir(os.path.join(root, "usr/include"), 0o755)
-
-            if args.build_dir is not None:
-                os.mkdir(os.path.join(root, "root/build"), 0o755)
-
-        if args.network_veth and not do_run_build_script:
-            os.mkdir(os.path.join(root, "etc/systemd"), 0o755)
-            os.mkdir(os.path.join(root, "etc/systemd/network"), 0o755)
-
-
-def patch_file(filepath: str, line_rewriter: Callable[[str], str]) -> None:
-    temp_new_filepath = filepath + ".tmp.new"
-
-    with open(filepath, "r") as old:
-        with open(temp_new_filepath, "w") as new:
-            for line in old:
-                new.write(line_rewriter(line))
-
-    shutil.copystat(filepath, temp_new_filepath)
-    os.remove(filepath)
-    shutil.move(temp_new_filepath, filepath)
-
-
-def disable_pam_securetty(root: str) -> None:
-    def _rm_securetty(line: str) -> str:
-        if "pam_securetty.so" in line:
-            return ""
-        return line
-
-    patch_file(os.path.join(root, "etc/pam.d/login"), _rm_securetty)
-
-
-def run_workspace_command(
-    args: CommandLineArguments,
-    root: str,
-    cmd: List[str],
-    network: bool = False,
-    env: Dict[str, str] = {},
-    nspawn_params: List[str] = [],
-) -> None:
-    cmdline = [
-        "systemd-nspawn",
-        "--quiet",
-        "--directory=" + root,
-        "--uuid=" + args.machine_id,
-        "--machine=mkosi-" + uuid.uuid4().hex,
-        "--as-pid2",
-        "--register=no",
-        "--bind=" + var_tmp(root) + ":/var/tmp",
-        "--setenv=SYSTEMD_OFFLINE=1",
-    ]
-
-    if network:
-        # If we're using the host network namespace, use the same resolver
-        cmdline += ["--bind-ro=/etc/resolv.conf"]
+        pesign_prepare(context)
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=output.name) as f:
+            os.chmod(f.name, stat.S_IMODE(input.stat().st_mode))
+            run(
+                [
+                    "pesign",
+                    "--certdir", context.workspace / "pesign",
+                    "--certificate", certificate_common_name(context, context.config.secure_boot_certificate),
+                    "--sign",
+                    "--force",
+                    "--in", input,
+                    "--out", "/dev/stdout",
+                ],
+                stdout=f,
+                sandbox=context.sandbox(
+                    binary="pesign",
+                    mounts=[
+                        Mount(context.workspace / "pesign", context.workspace / "pesign", ro=True),
+                        Mount(input, input, ro=True),
+                    ]
+                ),
+            )
+            output.unlink(missing_ok=True)
+            os.link(f.name, output)
     else:
-        cmdline += ["--private-network"]
+        die("One of sbsign or pesign is required to use SecureBoot=")
 
-    cmdline += [f"--setenv={k}={v}" for k, v in env.items()]
-
-    if nspawn_params:
-        cmdline += nspawn_params
-
-    result = run(cmdline + ["--"] + cmd, check=False)
-    if result.returncode != 0:
-        if "workspace-command" in arg_debug:
-            run(cmdline, check=False)
-        die(f"Workspace command `{' '.join(cmd)}` returned non-zero exit code {result.returncode}.")
+    return output
 
 
-def check_if_url_exists(url: str) -> bool:
-    req = urllib.request.Request(url, method="HEAD")
-    try:
-        if urllib.request.urlopen(req):
-            return True
-        return False
-    except:  # NOQA: E722
-        return False
-
-
-def make_executable(path: str) -> None:
-    st = os.stat(path)
-    os.chmod(path, st.st_mode | stat.S_IEXEC)
-
-
-def disable_kernel_install(args: CommandLineArguments, root: str) -> None:
-    # Let's disable the automatic kernel installation done by the kernel RPMs. After all, we want to built
-    # our own unified kernels that include the root hash in the kernel command line and can be signed as a
-    # single EFI executable. Since the root hash is only known when the root file system is finalized we turn
-    # off any kernel installation beforehand.
-    #
-    # For BIOS mode, we don't have that option, so do not mask the units.
-    if not args.bootable or args.bios_partno is not None or not args.with_unified_kernel_images:
+def install_systemd_boot(context: Context) -> None:
+    if not want_efi(context.config):
         return
 
-    for d in ("etc", "etc/kernel", "etc/kernel/install.d"):
-        mkdir_last(os.path.join(root, d), 0o755)
-
-    for f in ("50-dracut.install", "51-dracut-rescue.install", "90-loaderentry.install"):
-        path = os.path.join(root, "etc/kernel/install.d", f)
-        os.symlink("/dev/null", path)
-
-
-def reenable_kernel_install(args: CommandLineArguments, root: str) -> None:
-    if not args.bootable or args.bios_partno is not None or not args.with_unified_kernel_images:
+    if context.config.bootloader != Bootloader.systemd_boot:
         return
 
-    hook_path = os.path.join(root, "etc/kernel/install.d/50-mkosi-dracut-unified-kernel.install")
-    with open(hook_path, "w") as f:
-        f.write(DRACUT_UNIFIED_KERNEL_INSTALL)
-
-    make_executable(hook_path)
-
-
-def make_rpm_list(args: argparse.Namespace, packages: Set[str], do_run_build_script: bool) -> Set[str]:
-    packages = packages.copy()
-
-    if args.bootable:
-        # Temporary hack: dracut only adds crypto support to the initrd, if the cryptsetup binary is installed
-        if args.encrypt or args.verity:
-            packages.add("cryptsetup")
-
-        if args.output_format == OutputFormat.gpt_ext4:
-            packages.add("e2fsprogs")
-
-        if args.output_format == OutputFormat.gpt_xfs:
-            packages.add("xfsprogs")
-
-        if args.output_format == OutputFormat.gpt_btrfs:
-            packages.add("btrfs-progs")
-
-        if args.bios_partno:
-            if args.distribution in (Distribution.mageia, Distribution.openmandriva):
-                packages.add("grub2")
-            else:
-                packages.add("grub2-pc")
-
-    if not do_run_build_script and args.ssh:
-        packages.add("openssh-server")
-
-    return packages
-
-
-def clean_dnf_metadata(root: str) -> None:
-    """Removes dnf metadata iff /bin/dnf is not present in the image
-
-    If dnf is not installed, there doesn't seem to be much use in
-    keeping the dnf metadata, since it's not usable from within the
-    image anyway.
-    """
-    dnf_metadata_paths = [
-        os.path.join(root, "var/lib/dnf"),
-        *glob.glob(f"{os.path.join(root, 'var/log/dnf')}.*"),
-        *glob.glob(f"{os.path.join(root, 'var/log/hawkey')}.*"),
-        os.path.join(root, "var/cache/dnf"),
-    ]
-    dnf_path = os.path.join(root, "bin/dnf")
-    keep_dnf_data = os.access(dnf_path, os.F_OK, follow_symlinks=False)
-
-    if not keep_dnf_data or all(not os.path.exists(path) for path in dnf_metadata_paths):
+    if not any(gen_kernel_images(context)) and context.config.bootable == ConfigFeature.auto:
         return
 
-    with complete_step("Cleaning dnf metadata..."):
-        remove_glob(*dnf_metadata_paths)
-
-
-def clean_yum_metadata(root: str) -> None:
-    """Removes yum metadata iff /bin/yum is not present in the image"""
-    yum_metadata_paths = [
-        os.path.join(root, "var/lib/yum"),
-        *glob.glob(f"{os.path.join(root, 'var/log/yum')}.*"),
-        os.path.join(root, "var/cache/yum"),
-    ]
-    yum_path = os.path.join(root, "bin/yum")
-    keep_yum_data = os.access(yum_path, os.F_OK, follow_symlinks=False)
-
-    if not keep_yum_data or all(not os.path.exists(path) for path in yum_metadata_paths):
+    if not context.config.find_binary("bootctl"):
+        if context.config.bootable == ConfigFeature.enabled:
+            die("An EFI bootable image with systemd-boot was requested but bootctl was not found")
         return
 
-    with complete_step("Cleaning yum metadata..."):
-        remove_glob(*yum_metadata_paths)
-
-
-def clean_rpm_metadata(root: str) -> None:
-    """Removes rpm metadata iff /bin/rpm is not present in the image"""
-    rpm_metadata_path = os.path.join(root, "var/lib/rpm")
-    rpm_path = os.path.join(root, "bin/rpm")
-    keep_rpm_data = os.access(rpm_path, os.F_OK, follow_symlinks=False)
-
-    if not keep_rpm_data or not os.path.exists(rpm_metadata_path):
+    directory = context.root / "usr/lib/systemd/boot/efi"
+    signed = context.config.shim_bootloader == ShimBootloader.signed
+    if not directory.glob("*.efi.signed" if signed else "*.efi"):
+        if context.config.bootable == ConfigFeature.enabled:
+            die(f"An EFI bootable image with systemd-boot was requested but a {'signed ' if signed else ''}"
+                f"systemd-boot binary was not found at {directory.relative_to(context.root)}")
         return
 
-    with complete_step("Cleaning rpm metadata..."):
-        remove_glob(rpm_metadata_path)
+    if context.config.secure_boot and not signed:
+        with complete_step("Signing systemd-boot binaries…"):
+            for input in itertools.chain(directory.glob('*.efi'), directory.glob('*.EFI')):
+                output = directory / f"{input}.signed"
+                sign_efi_binary(context, input, output)
 
+    with complete_step("Installing systemd-boot…"):
+        run(
+            ["bootctl", "install", "--root=/buildroot", "--all-architectures", "--no-variables"],
+            env={"SYSTEMD_ESP_PATH": "/efi", "SYSTEMD_XBOOTLDR_PATH": "/boot"},
+            sandbox=context.sandbox(binary="bootctl", mounts=[Mount(context.root, "/buildroot")]),
+        )
 
-def clean_tdnf_metadata(root: str) -> None:
-    """Removes tdnf metadata iff /bin/tdnf is not present in the image"""
-    tdnf_metadata_paths = [*glob.glob(f"{os.path.join(root, 'var/log/tdnf')}.*"), os.path.join(root, "var/cache/tdnf")]
-    tdnf_path = os.path.join(root, "usr/bin/tdnf")
-    keep_tdnf_data = os.access(tdnf_path, os.F_OK, follow_symlinks=False)
+        if context.config.shim_bootloader != ShimBootloader.none:
+            shutil.copy2(
+                context.root / f"efi/EFI/systemd/systemd-boot{context.config.architecture.to_efi()}.efi",
+                context.root / shim_second_stage_binary(context),
+            )
 
-    if not keep_tdnf_data or all(not os.path.exists(path) for path in tdnf_metadata_paths):
-        return
+    if context.config.secure_boot and context.config.secure_boot_auto_enroll:
+        assert context.config.secure_boot_key
+        assert context.config.secure_boot_certificate
 
-    with complete_step("Cleaning tdnf metadata..."):
-        remove_glob(*tdnf_metadata_paths)
+        with complete_step("Setting up secure boot auto-enrollment…"):
+            keys = context.root / "efi/loader/keys/auto"
+            with umask(~0o700):
+                keys.mkdir(parents=True, exist_ok=True)
 
-
-def clean_package_manager_metadata(root: str) -> None:
-    """Clean up package manager metadata
-
-    Try them all regardless of the distro: metadata is only removed if the
-    package manager is present in the image.
-    """
-
-    # we try then all: metadata will only be touched if any of them are in the
-    # final image
-    clean_dnf_metadata(root)
-    clean_yum_metadata(root)
-    clean_rpm_metadata(root)
-    clean_tdnf_metadata(root)
-    # FIXME: implement cleanup for other package managers
-
-
-def invoke_dnf(
-    args: CommandLineArguments, root: str, repositories: List[str], packages: Set[str], do_run_build_script: bool
-) -> None:
-    repos = ["--enablerepo=" + repo for repo in repositories]
-    config_file = os.path.join(workspace(root), "dnf.conf")
-    packages = make_rpm_list(args, packages, do_run_build_script)
-
-    cmdline = [
-        "dnf",
-        "-y",
-        "--config=" + config_file,
-        "--best",
-        "--allowerasing",
-        "--releasever=" + args.release,
-        "--installroot=" + root,
-        "--disablerepo=*",
-        *repos,
-        "--setopt=keepcache=1",
-        "--setopt=install_weak_deps=0",
-    ]
-
-    if args.architecture is not None:
-        cmdline += [f"--forcearch={args.architecture}"]
-
-    if args.with_network == "never":
-        cmdline += ["--cacheonly"]
-
-    if not args.with_docs:
-        cmdline += ["--nodocs"]
-
-    cmdline += ["install", *packages]
-
-    with mount_api_vfs(args, root):
-        run(cmdline)
-
-
-def invoke_tdnf(
-    args: CommandLineArguments,
-    root: str,
-    repositories: List[str],
-    packages: Set[str],
-    gpgcheck: bool,
-    do_run_build_script: bool,
-) -> None:
-    repos = ["--enablerepo=" + repo for repo in repositories]
-    config_file = os.path.join(workspace(root), "dnf.conf")
-    packages = make_rpm_list(args, packages, do_run_build_script)
-
-    cmdline = [
-        "tdnf",
-        "-y",
-        "--config=" + config_file,
-        "--releasever=" + args.release,
-        "--installroot=" + root,
-        "--disablerepo=*",
-        *repos,
-    ]
-
-    if not gpgcheck:
-        cmdline.append("--nogpgcheck")
-
-    cmdline += ["install", *packages]
-
-    with mount_api_vfs(args, root):
-        run(cmdline)
-
-
-class Repo(NamedTuple):
-    id: str
-    name: str
-    url: str
-    gpgpath: str
-    gpgurl: Optional[str] = None
-
-
-def setup_dnf(args: CommandLineArguments, root: str, repos: List[Repo] = []) -> None:
-    gpgcheck = True
-
-    repo_file = os.path.join(workspace(root), "temp.repo")
-    with open(repo_file, "w") as f:
-        for repo in repos:
-            gpgkey: Optional[str] = None
-
-            if os.path.exists(repo.gpgpath):
-                gpgkey = f"file://{repo.gpgpath}"
-            elif repo.gpgurl:
-                gpgkey = repo.gpgurl
-            else:
-                warn(f"GPG key not found at {repo.gpgpath}. Not checking GPG signatures.")
-                gpgcheck = False
-
-            f.write(
-                dedent(
-                    f"""\
-                    [{repo.id}]
-                    name={repo.name}
-                    {repo.url}
-                    gpgkey={gpgkey or ''}
-                    """
+            # sbsiglist expects a DER certificate.
+            with umask(~0o600), open(context.workspace / "mkosi.der", "wb") as f:
+                run(
+                    [
+                        "openssl",
+                        "x509",
+                        "-outform", "DER",
+                        "-in", context.config.secure_boot_certificate,
+                    ],
+                    stdout=f,
+                    sandbox=context.sandbox(
+                        binary="openssl",
+                        mounts=[
+                            Mount(
+                                context.config.secure_boot_certificate,
+                                context.config.secure_boot_certificate,
+                                ro=True
+                            ),
+                        ],
+                    ),
                 )
-            )
 
-    config_file = os.path.join(workspace(root), "dnf.conf")
-    with open(config_file, "w") as f:
-        f.write(
-            dedent(
-                f"""\
-                [main]
-                gpgcheck={'1' if gpgcheck else '0'}
-                {"repodir" if args.distribution == Distribution.photon else "reposdir"}={workspace(root)}
-                """
-            )
-        )
-
-
-@complete_step("Installing Photon")
-def install_photon(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    release_url = "baseurl=https://dl.bintray.com/vmware/photon_release_$releasever_$basearch"
-    updates_url = "baseurl=https://dl.bintray.com/vmware/photon_updates_$releasever_$basearch"
-    gpgpath = "/etc/pki/rpm-gpg/VMWARE-RPM-GPG-KEY"
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("photon", f"VMware Photon OS {args.release} Release", release_url, gpgpath),
-            Repo("photon-updates", f"VMware Photon OS {args.release} Updates", updates_url, gpgpath),
-        ],
-    )
-
-    packages = {"minimal"}
-    if not do_run_build_script and args.bootable:
-        packages |= {"linux", "initramfs"}
-
-    invoke_tdnf(
-        args,
-        root,
-        args.repositories or ["photon", "photon-updates"],
-        packages,
-        os.path.exists(gpgpath),
-        do_run_build_script,
-    )
-
-
-@complete_step("Installing Clear Linux")
-def install_clear(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    if args.release == "latest":
-        release = "clear"
-    else:
-        release = "clear/" + args.release
-
-    packages = {"os-core-plus", *args.packages}
-    if do_run_build_script:
-        packages.update(args.build_packages)
-    if not do_run_build_script and args.bootable:
-        packages.add("kernel-native")
-    if not do_run_build_script and args.ssh:
-        packages.add("openssh-server")
-
-    swupd_extract = shutil.which("swupd-extract")
-
-    if swupd_extract is None:
-        die(
-            dedent(
-                """
-                Couldn't find swupd-extract program, download (or update it) it using:
-
-                  go get -u github.com/clearlinux/mixer-tools/swupd-extract
-
-                and it will be installed by default in ~/go/bin/swupd-extract. Also
-                ensure that you have openssl program in your system.
-                """
-            )
-        )
-
-    print(f"Using {swupd_extract}")
-
-    run([swupd_extract, "-output", root, "-state", args.cache_path, release, *packages], check=True)
-
-    os.symlink("../run/systemd/resolve/resolv.conf", os.path.join(root, "etc/resolv.conf"))
-
-    # Clear Linux doesn't have a /etc/shadow at install time, it gets
-    # created when the root first login. To set the password via
-    # mkosi, create one.
-    if not do_run_build_script and args.password is not None:
-        shadow_file = os.path.join(root, "etc/shadow")
-        with open(shadow_file, "w") as f:
-            f.write("root::::::::")
-        os.chmod(shadow_file, 0o400)
-        # Password is already empty for root, so no need to reset it later.
-        if args.password == "":
-            args.password = None
-
-
-@complete_step("Installing Fedora")
-def install_fedora(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    if args.release == "rawhide":
-        last = sorted(FEDORA_KEYS_MAP)[-1]
-        warn(f"Assuming rawhide is version {last} — " + "You may specify otherwise with --release=rawhide-<version>")
-        args.releasever = last
-    elif args.release.startswith("rawhide-"):
-        args.release, args.releasever = args.release.split("-")
-        MkosiPrinter.info(f"Fedora rawhide — release version: {args.releasever}")
-    else:
-        args.releasever = args.release
-
-    arch = args.architecture or platform.machine()
-
-    if args.mirror:
-        baseurl = urllib.parse.urljoin(args.mirror, f"releases/{args.release}/Everything/$basearch/os/")
-        media = urllib.parse.urljoin(baseurl.replace("$basearch", arch), "media.repo")
-        if not check_if_url_exists(media):
-            baseurl = urllib.parse.urljoin(args.mirror, f"development/{args.release}/Everything/$basearch/os/")
-
-        release_url = f"baseurl={baseurl}"
-        updates_url = f"baseurl={args.mirror}/updates/{args.release}/Everything/$basearch/"
-    else:
-        release_url = (
-            f"metalink=https://mirrors.fedoraproject.org/metalink?" + f"repo=fedora-{args.release}&arch=$basearch"
-        )
-        updates_url = (
-            f"metalink=https://mirrors.fedoraproject.org/metalink?"
-            + f"repo=updates-released-f{args.release}&arch=$basearch"
-        )
-
-    if args.releasever in FEDORA_KEYS_MAP:
-        gpgid = f"keys/{FEDORA_KEYS_MAP[args.releasever]}.txt"
-    else:
-        gpgid = "fedora.gpg"
-
-    gpgpath = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-{args.releasever}-{arch}"
-    gpgurl = urllib.parse.urljoin("https://getfedora.org/static/", gpgid)
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("fedora", f"Fedora {args.release.capitalize()} - base", release_url, gpgpath, gpgurl),
-            Repo("updates", f"Fedora {args.release.capitalize()} - updates", updates_url, gpgpath, gpgurl),
-        ],
-    )
-
-    packages = {"fedora-release", "glibc-minimal-langpack", "systemd", *args.packages}
-    if not do_run_build_script and args.bootable:
-        packages |= {"kernel-core", "kernel-modules", "systemd-udev", "binutils", "dracut"}
-        configure_dracut(args, root)
-    if do_run_build_script:
-        packages.update(args.build_packages)
-    if not do_run_build_script and args.network_veth:
-        packages.add("systemd-networkd")
-    invoke_dnf(args, root, args.repositories or ["fedora", "updates"], packages, do_run_build_script)
-
-    with open(os.path.join(root, "etc/locale.conf"), "w") as f:
-        f.write("LANG=C.UTF-8\n")
-
-
-@complete_step("Installing Mageia")
-def install_mageia(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    if args.mirror:
-        baseurl = f"{args.mirror}/distrib/{args.release}/x86_64/media/core/"
-        release_url = f"baseurl={baseurl}/release/"
-        updates_url = f"baseurl={baseurl}/updates/"
-    else:
-        baseurl = f"https://www.mageia.org/mirrorlist/?release={args.release}&arch=x86_64&section=core"
-        release_url = f"mirrorlist={baseurl}&repo=release"
-        updates_url = f"mirrorlist={baseurl}&repo=updates"
-
-    gpgpath = "/etc/pki/rpm-gpg/RPM-GPG-KEY-Mageia"
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("mageia", f"Mageia {args.release} Core Release", release_url, gpgpath),
-            Repo("updates", f"Mageia {args.release} Core Updates", updates_url, gpgpath),
-        ],
-    )
-
-    packages = {"basesystem-minimal", *args.packages}
-    if not do_run_build_script and args.bootable:
-        packages |= {"kernel-server-latest", "binutils", "dracut"}
-
-        configure_dracut(args, root)
-        # Mageia ships /etc/50-mageia.conf that omits systemd from the initramfs and disables hostonly.
-        # We override that again so our defaults get applied correctly on Mageia as well.
-        with open(os.path.join(root, "etc/dracut.conf.d/51-mkosi-override-mageia.conf"), "w") as f:
-            f.write("hostonly=no\n")
-            f.write('omit_dracutmodules=""\n')
-    if do_run_build_script:
-        packages.update(args.build_packages)
-    invoke_dnf(args, root, args.repositories or ["mageia", "updates"], packages, do_run_build_script)
-
-    disable_pam_securetty(root)
-
-
-@complete_step("Installing OpenMandriva")
-def install_openmandriva(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    release = args.release.strip("'")
-
-    if release[0].isdigit():
-        release_model = "rock"
-    elif release == "cooker":
-        release_model = "cooker"
-    else:
-        release_model = release
-
-    if args.mirror:
-        baseurl = f"{args.mirror}/{release_model}/repository/x86_64/main"
-        release_url = f"baseurl={baseurl}/release/"
-        updates_url = f"baseurl={baseurl}/updates/"
-    else:
-        baseurl = f"http://mirrors.openmandriva.org/mirrors.php?platform={release_model}&arch=x86_64&repo=main"
-        release_url = f"mirrorlist={baseurl}&release=release"
-        updates_url = f"mirrorlist={baseurl}&release=updates"
-
-    gpgpath = "/etc/pki/rpm-gpg/RPM-GPG-KEY-OpenMandriva"
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("openmandriva", f"OpenMandriva {release_model} Main", release_url, gpgpath),
-            Repo("updates", f"OpenMandriva {release_model} Main Updates", updates_url, gpgpath),
-        ],
-    )
-
-    # well we may use basesystem here, but that pulls lot of stuff
-    packages = {"basesystem-minimal", "systemd", *args.packages}
-    if not do_run_build_script and args.bootable:
-        packages |= {"kernel-release-server", "binutils", "systemd-boot", "dracut", "timezone", "systemd-cryptsetup"}
-        configure_dracut(args, root)
-    if do_run_build_script:
-        packages.update(args.build_packages)
-    invoke_dnf(args, root, args.repositories or ["openmandriva", "updates"], packages, do_run_build_script)
-
-    disable_pam_securetty(root)
-
-
-def invoke_yum(
-    args: CommandLineArguments, root: str, repositories: List[str], packages: Set[str], do_run_build_script: bool
-) -> None:
-    repos = ["--enablerepo=" + repo for repo in repositories]
-    config_file = os.path.join(workspace(root), "dnf.conf")
-    packages = make_rpm_list(args, packages, do_run_build_script)
-
-    cmdline = [
-        "yum",
-        "-y",
-        "--config=" + config_file,
-        "--releasever=" + args.release,
-        "--installroot=" + root,
-        "--disablerepo=*",
-        *repos,
-        "--setopt=keepcache=1",
-    ]
-
-    if args.architecture is not None:
-        cmdline += [f"--forcearch={args.architecture}"]
-
-    if not args.with_docs:
-        cmdline.append("--setopt=tsflags=nodocs")
-
-    cmdline += ["install", *packages]
-
-    with mount_api_vfs(args, root):
-        run(cmdline)
-
-
-def invoke_dnf_or_yum(
-    args: CommandLineArguments, root: str, repositories: List[str], packages: Set[str], do_run_build_script: bool
-) -> None:
-    if shutil.which("dnf") is None:
-        invoke_yum(args, root, repositories, packages, do_run_build_script)
-    else:
-        invoke_dnf(args, root, repositories, packages, do_run_build_script)
-
-
-def install_centos_old(args: CommandLineArguments, root: str, epel_release: int) -> List[str]:
-    # Repos for CentOS 7 and earlier
-
-    gpgpath = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-{args.release}"
-    gpgurl = f"https://www.centos.org/keys/RPM-GPG-KEY-CentOS-{args.release}"
-    epel_gpgpath = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-{epel_release}"
-    epel_gpgurl = f"https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{epel_release}"
-
-    if args.mirror:
-        release_url = f"baseurl={args.mirror}/centos/{args.release}/os/x86_64"
-        updates_url = f"baseurl={args.mirror}/centos/{args.release}/updates/x86_64/"
-        extras_url = f"baseurl={args.mirror}/centos/{args.release}/extras/x86_64/"
-        centosplus_url = f"baseurl={args.mirror}/centos/{args.release}/centosplus/x86_64/"
-        epel_url = f"baseurl={args.mirror}/epel/{epel_release}/x86_64/"
-    else:
-        release_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=os"
-        updates_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=updates"
-        extras_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=extras"
-        centosplus_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=centosplus"
-        epel_url = f"mirrorlist=https://mirrors.fedoraproject.org/mirrorlist?repo=epel-{epel_release}&arch=x86_64"
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("base", f"CentOS-{args.release} - Base", release_url, gpgpath, gpgurl),
-            Repo("updates", f"CentOS-{args.release} - Updates", updates_url, gpgpath, gpgurl),
-            Repo("extras", f"CentOS-{args.release} - Extras", extras_url, gpgpath, gpgurl),
-            Repo("centosplus", f"CentOS-{args.release} - Plus", centosplus_url, gpgpath, gpgurl),
-            Repo(
-                "epel",
-                f"name=Extra Packages for Enterprise Linux {epel_release} - $basearch",
-                epel_url,
-                epel_gpgpath,
-                epel_gpgurl,
-            ),
-        ],
-    )
-
-    return ["base", "updates", "extras", "centosplus"]
-
-
-def install_centos_new(args: CommandLineArguments, root: str, epel_release: int) -> List[str]:
-    # Repos for CentOS 8 and later
-
-    gpgpath = "/etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial"
-    gpgurl = "https://www.centos.org/keys/RPM-GPG-KEY-CentOS-Official"
-    epel_gpgpath = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-{epel_release}"
-    epel_gpgurl = f"https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{epel_release}"
-
-    if args.mirror:
-        appstream_url = f"baseurl={args.mirror}/centos/{args.release}/AppStream/x86_64/os"
-        baseos_url = f"baseurl={args.mirror}/centos/{args.release}/BaseOS/x86_64/os"
-        extras_url = f"baseurl={args.mirror}/centos/{args.release}/extras/x86_64/os"
-        centosplus_url = f"baseurl={args.mirror}/centos/{args.release}/centosplus/x86_64/os"
-        epel_url = f"baseurl={args.mirror}/epel/{epel_release}/Everything/x86_64"
-    else:
-        appstream_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=AppStream"
-        baseos_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=BaseOS"
-        extras_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=extras"
-        centosplus_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=centosplus"
-        epel_url = f"mirrorlist=https://mirrors.fedoraproject.org/mirrorlist?repo=epel-{epel_release}&arch=x86_64"
-
-    setup_dnf(
-        args,
-        root,
-        repos=[
-            Repo("AppStream", f"CentOS-{args.release} - AppStream", appstream_url, gpgpath, gpgurl),
-            Repo("BaseOS", f"CentOS-{args.release} - Base", baseos_url, gpgpath, gpgurl),
-            Repo("extras", f"CentOS-{args.release} - Extras", extras_url, gpgpath, gpgurl),
-            Repo("centosplus", f"CentOS-{args.release} - Plus", centosplus_url, gpgpath, gpgurl),
-            Repo(
-                "epel",
-                f"name=Extra Packages for Enterprise Linux {epel_release} - $basearch",
-                epel_url,
-                epel_gpgpath,
-                epel_gpgurl,
-            ),
-        ],
-    )
-
-    return ["AppStream", "BaseOS", "extras", "centosplus"]
-
-
-def is_older_than_centos8(release: str) -> bool:
-    # CentOS 7 contains some very old versions of certain libraries
-    # which require workarounds in different places.
-    # Additionally the repositories have been changed between 7 and 8
-    epel_release = release.split(".")[0]
-    try:
-        return int(epel_release) <= 7
-    except ValueError:
-        return False
-
-
-@complete_step("Installing CentOS")
-def install_centos(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    old = is_older_than_centos8(args.release)
-    epel_release = int(args.release.split(".")[0])
-
-    if old:
-        default_repos = install_centos_old(args, root, epel_release)
-    else:
-        default_repos = install_centos_new(args, root, epel_release)
-
-    packages = {"centos-release", "systemd", *args.packages}
-    if not do_run_build_script and args.bootable:
-        packages |= {"kernel", "dracut", "binutils"}
-        configure_dracut(args, root)
-        if old:
-            packages |= {"grub2-efi", "grub2-tools", "grub2-efi-x64-modules", "shim-x64", "efibootmgr", "efivar-libs"}
-        else:
-            # this does not exist on CentOS 7
-            packages.add("systemd-udev")
-
-    if do_run_build_script:
-        packages.update(args.build_packages)
-
-    repos = args.repositories or default_repos
-
-    if args.distribution == Distribution.centos_epel:
-        repos += ["epel"]
-        packages.add("epel-release")
-
-    if do_run_build_script:
-        packages.update(args.build_packages)
-
-    if not do_run_build_script and args.distribution == Distribution.centos_epel and args.network_veth:
-        packages.add("systemd-networkd")
-
-    invoke_dnf_or_yum(args, root, repos, packages, do_run_build_script)
-
-
-def debootstrap_knows_arg(arg: str) -> bool:
-    return bytes("invalid option", "UTF-8") not in run(["debootstrap", arg], stdout=PIPE, check=False).stdout
-
-
-def install_debian_or_ubuntu(args: CommandLineArguments, root: str, *, do_run_build_script: bool, mirror: str) -> None:
-    repos = set(args.repositories) or {"main"}
-    # Ubuntu needs the 'universe' repo to install 'dracut'
-    if args.distribution == Distribution.ubuntu and args.bootable:
-        repos.add("universe")
-
-    cmdline = ["debootstrap", "--variant=minbase", "--merged-usr", f"--components={','.join(repos)}"]
-
-    if args.architecture is not None:
-        debarch = DEBIAN_ARCHITECTURES.get(args.architecture)
-        cmdline += [f"--arch={debarch}"]
-
-    # Let's use --no-check-valid-until only if debootstrap knows it
-    if debootstrap_knows_arg("--no-check-valid-until"):
-        cmdline.append("--no-check-valid-until")
-
-    # Either the image builds or it fails and we restart, we don't need safety fsyncs when bootstrapping
-    # Add it before debootstrap, as the second stage already uses dpkg from the chroot
-    dpkg_io_conf = os.path.join(root, "etc/dpkg/dpkg.cfg.d/unsafe_io")
-    os.makedirs(os.path.dirname(dpkg_io_conf), mode=0o755, exist_ok=True)
-    with open(dpkg_io_conf, "w") as f:
-        f.write("force-unsafe-io\n")
-
-    cmdline += [args.release, root, mirror]
-    run(cmdline)
-
-    # Install extra packages via the secondary APT run, because it is smarter and can deal better with any
-    # conflicts. dbus and libpam-systemd are optional dependencies for systemd in debian so we include them
-    # explicitly.
-    extra_packages = {"systemd", "systemd-sysv", "dbus", "libpam-systemd"}
-    extra_packages.update(args.packages)
-
-    if do_run_build_script:
-        extra_packages.update(args.build_packages)
-
-    if not do_run_build_script and args.bootable:
-        extra_packages.add("dracut")
-        extra_packages.add("binutils")
-
-        configure_dracut(args, root)
-
-        if args.distribution == Distribution.ubuntu:
-            extra_packages.add("linux-generic")
-        else:
-            extra_packages.add("linux-image-amd64")
-
-        if args.bios_partno:
-            extra_packages.add("grub-pc")
-
-        if args.output_format == OutputFormat.gpt_btrfs:
-            extra_packages.add("btrfs-progs")
-
-    if not do_run_build_script and args.ssh:
-        extra_packages.add("openssh-server")
-
-    # Debian policy is to start daemons by default. The policy-rc.d script can be used choose which ones to
-    # start. Let's install one that denies all daemon startups.
-    # See https://people.debian.org/~hmh/invokerc.d-policyrc.d-specification.txt for more information.
-    # Note: despite writing in /usr/sbin, this file is not shipped by the OS and instead should be managed by
-    # the admin.
-    policyrcd = os.path.join(root, "usr/sbin/policy-rc.d")
-    with open(policyrcd, "w") as f:
-        f.write("#!/bin/sh\nexit 101\n")
-    os.chmod(policyrcd, 0o755)
-
-    doc_paths = [
-        "/usr/share/locale",
-        "/usr/share/doc",
-        "/usr/share/man",
-        "/usr/share/groff",
-        "/usr/share/info",
-        "/usr/share/lintian",
-        "/usr/share/linda",
-    ]
-    if not args.with_docs:
-        # Remove documentation installed by debootstrap
-        cmdline = ["/bin/rm", "-rf"] + doc_paths
-        run_workspace_command(args, root, cmdline)
-        # Create dpkg.cfg to ignore documentation on new packages
-        dpkg_conf = os.path.join(root, "etc/dpkg/dpkg.cfg.d/01_nodoc")
-        with open(dpkg_conf, "w") as f:
-            f.writelines(f"path-exclude {d}/*\n" for d in doc_paths)
-
-    cmdline = ["/usr/bin/apt-get", "--assume-yes", "--no-install-recommends", "install", *extra_packages]
-    env = {
-        "DEBIAN_FRONTEND": "noninteractive",
-        "DEBCONF_NONINTERACTIVE_SEEN": "true",
-    }
-
-    if not do_run_build_script and args.bootable and args.with_unified_kernel_images:
-        # Disable dracut postinstall script for this apt-get run.
-        env["INITRD"] = "No"
-
-        if args.distribution == Distribution.debian and args.release == "unstable":
-            # systemd-boot won't boot unified kernel images generated without a BUILD_ID or VERSION_ID in
-            # /etc/os-release.
-            with open(os.path.join(root, "etc/os-release"), "a") as f:
-                f.write("BUILD_ID=unstable\n")
-
-    run_workspace_command(args, root, cmdline, network=True, env=env)
-    os.unlink(policyrcd)
-    os.unlink(dpkg_io_conf)
-    # Debian still has pam_securetty module enabled
-    disable_pam_securetty(root)
-
-
-@complete_step("Installing Debian")
-def install_debian(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    install_debian_or_ubuntu(args, root, do_run_build_script=do_run_build_script, mirror=args.mirror)
-
-
-@complete_step("Installing Ubuntu")
-def install_ubuntu(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    install_debian_or_ubuntu(args, root, do_run_build_script=do_run_build_script, mirror=args.mirror)
-
-
-@complete_step("Installing Arch Linux")
-def install_arch(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    if args.release is not None:
-        MkosiPrinter.info("Distribution release specification is not supported for Arch Linux, ignoring.")
-
-    if args.mirror:
-        if platform.machine() == "aarch64":
-            server = f"Server = {args.mirror}/$arch/$repo"
-        else:
-            server = f"Server = {args.mirror}/$repo/os/$arch"
-    else:
-        # Instead of harcoding a single mirror, we retrieve a list of mirrors from Arch's mirrorlist
-        # generator ordered by mirror score. This usually results in a solid mirror and also ensures that we
-        # have fallback mirrors available if necessary. Finally, the mirrors will be more likely to be up to
-        # date and we won't end up with a stable release that hardcodes a broken mirror.
-        mirrorlist = os.path.join(workspace(root), "mirrorlist")
-        with urllib.request.urlopen(
-            "https://www.archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4&use_mirror_status=on"
-        ) as r:
-            with open(mirrorlist, "w") as f:
-                mirrors = r.readlines()
-                uncommented = [line.decode("utf-8")[1:] for line in mirrors]
-                f.writelines(uncommented)
-                server = f"Include = {mirrorlist}"
-
-    # Create base layout for pacman and pacman-key
-    os.makedirs(os.path.join(root, "var/lib/pacman"), 0o755, exist_ok=True)
-    os.makedirs(os.path.join(root, "etc/pacman.d/gnupg"), 0o755, exist_ok=True)
-
-    # Permissions on these directories are all 0o777 because of `mount --bind`
-    # limitations but pacman expects them to be 0o755 so we fix them before
-    # calling pacstrap (except /var/tmp which is 0o1777).
-    fix_permissions_dirs = {
-        "boot": 0o755,
-        "etc": 0o755,
-        "etc/pacman.d": 0o755,
-        "var": 0o755,
-        "var/lib": 0o755,
-        "var/cache": 0o755,
-        "var/cache/pacman": 0o755,
-        "var/tmp": 0o1777,
-        "run": 0o755,
-    }
-
-    for dir, permissions in fix_permissions_dirs.items():
-        path = os.path.join(root, dir)
-        if os.path.exists(path):
-            os.chmod(path, permissions)
-
-    pacman_conf = os.path.join(workspace(root), "pacman.conf")
-    with open(pacman_conf, "w") as f:
-        f.write(
-            dedent(
-                f"""\
-                [options]
-                RootDir     = {root}
-                LogFile     = /dev/null
-                CacheDir    = {root}/var/cache/pacman/pkg/
-                GPGDir      = {root}/etc/pacman.d/gnupg/
-                HookDir     = {root}/etc/pacman.d/hooks/
-                HoldPkg     = pacman glibc
-                Architecture = auto
-                Color
-                CheckSpace
-                SigLevel    = Required DatabaseOptional TrustAll
-
-                [core]
-                {server}
-
-                [extra]
-                {server}
-
-                [community]
-                {server}
-                """
-            )
-        )
-
-        if args.repositories:
-            for repository in args.repositories:
-                # repositories must be passed in the form <repo name>::<repo url>
-                repository_name, repository_server = repository.split("::", 1)
-
-                # note: for additional repositories, signature checking options are set to pacman's default values
-                f.write(
-                    dedent(
-                        f"""\
-
-                        [{repository_name}]
-                        SigLevel = Optional TrustedOnly
-                        Server = {repository_server}
-                        """
+            with umask(~0o600), open(context.workspace / "mkosi.esl", "wb") as f:
+                run(
+                    [
+                        "sbsiglist",
+                        "--owner", str(uuid.uuid4()),
+                        "--type", "x509",
+                        "--output", "/dev/stdout",
+                        context.workspace / "mkosi.der",
+                    ],
+                    stdout=f,
+                    sandbox=context.sandbox(
+                        binary="sbsiglist",
+                        mounts=[Mount(context.workspace / "mkosi.der", context.workspace / "mkosi.der", ro=True)]
+                    ),
+                )
+
+            # We reuse the key for all secure boot databases to keep things simple.
+            for db in ["PK", "KEK", "db"]:
+                with umask(~0o600), open(keys / f"{db}.auth", "wb") as f:
+                    cmd: list[PathString] = [
+                        "sbvarsign",
+                        "--attr",
+                            "NON_VOLATILE,BOOTSERVICE_ACCESS,RUNTIME_ACCESS,TIME_BASED_AUTHENTICATED_WRITE_ACCESS",
+                        "--key", context.config.secure_boot_key,
+                        "--cert", context.config.secure_boot_certificate,
+                        "--output", "/dev/stdout",
+                    ]
+                    mounts = [
+                        Mount(
+                            context.config.secure_boot_certificate,
+                            context.config.secure_boot_certificate,
+                            ro=True
+                        ),
+                        Mount(context.workspace / "mkosi.esl", context.workspace / "mkosi.esl", ro=True),
+                    ]
+                    if context.config.secure_boot_key_source.type == KeySource.Type.engine:
+                        cmd += ["--engine", context.config.secure_boot_key_source.source]
+                    if context.config.secure_boot_key.exists():
+                        mounts += [Mount(context.config.secure_boot_key, context.config.secure_boot_key, ro=True)]
+                    cmd += [db, context.workspace / "mkosi.esl"]
+                    run(
+                        cmd,
+                        stdout=f,
+                        sandbox=context.sandbox(
+                            binary="sbvarsign",
+                            mounts=mounts,
+                            devices=context.config.secure_boot_key_source.type != KeySource.Type.file,
+                        ),
                     )
-                )
-
-    if not do_run_build_script and args.bootable:
-        hooks_dir = os.path.join(root, "etc/pacman.d/hooks")
-        scripts_dir = os.path.join(root, "etc/pacman.d/scripts")
-
-        os.makedirs(hooks_dir, 0o755, exist_ok=True)
-        os.makedirs(scripts_dir, 0o755, exist_ok=True)
-
-        # Disable depmod pacman hook as depmod is handled by kernel-install as well.
-        os.symlink("/dev/null", os.path.join(hooks_dir, "60-depmod.hook"))
-
-        kernel_add_hook = os.path.join(hooks_dir, "90-mkosi-kernel-add.hook")
-        with open(kernel_add_hook, "w") as f:
-            f.write(
-                dedent(
-                    """\
-                    [Trigger]
-                    Operation = Install
-                    Operation = Upgrade
-                    Type = Path
-                    Target = usr/lib/modules/*/vmlinuz
-                    Target = usr/lib/kernel/install.d/*
-                    Target = boot/*-ucode.img
-
-                    [Trigger]
-                    Operation = Install
-                    Operation = Upgrade
-                    Type = Package
-                    Target = systemd
-
-                    [Action]
-                    Description = Adding kernel and initramfs images to /boot...
-                    When = PostTransaction
-                    Exec = /etc/pacman.d/scripts/mkosi-kernel-add
-                    NeedsTargets
-                    """
-                )
-            )
-
-        kernel_add_script = os.path.join(scripts_dir, "mkosi-kernel-add")
-        with open(kernel_add_script, "w") as f:
-            f.write(
-                dedent(
-                    """\
-                    #!/bin/bash -e
-                    shopt -s nullglob
-
-                    declare -a kernel_version
-
-                    # Check the targets passed by the pacman hook.
-                    while read -r line
-                    do
-                        if [[ "$line" =~ usr/lib/modules/([^/]+)/vmlinuz ]]
-                        then
-                            kernel_version+=( "${BASH_REMATCH[1]}" )
-                        else
-                            # If a non-matching line is passed, just rebuild all kernels.
-                            kernel_version=()
-                            for f in /usr/lib/modules/*/vmlinuz
-                            do
-                                kernel_version+=( "$(basename "$(dirname "$f")")" )
-                            done
-                            break
-                        fi
-                    done
-
-                    # (re)build the kernel images.
-                    for kv in "${kernel_version[@]}"
-                    do
-                        kernel-install add "$kv" "/usr/lib/modules/${kv}/vmlinuz"
-                    done
-                    """
-                )
-            )
-
-        make_executable(kernel_add_script)
-
-        kernel_remove_hook = os.path.join(hooks_dir, "60-mkosi-kernel-remove.hook")
-        with open(kernel_remove_hook, "w") as f:
-            f.write(
-                dedent(
-                    """\
-                    [Trigger]
-                    Operation = Upgrade
-                    Operation = Remove
-                    Type = Path
-                    Target = usr/lib/modules/*/vmlinuz
-
-                    [Action]
-                    Description = Removing kernel and initramfs images from /boot...
-                    When = PreTransaction
-                    Exec = /etc/pacman.d/mkosi-kernel-remove
-                    NeedsTargets
-                    """
-                )
-            )
-
-        kernel_remove_script = os.path.join(scripts_dir, "mkosi-kernel-remove")
-        with open(kernel_remove_script, "w") as f:
-            f.write(
-                dedent(
-                    """\
-                    #!/bin/bash -e
-
-                    while read -r f; do
-                        kernel-install remove "$(basename "$(dirname "$f")")"
-                    done
-                    """
-                )
-            )
-
-        make_executable(kernel_remove_script)
-
-        if args.esp_partno is not None:
-            bootctl_update_hook = os.path.join(hooks_dir, "91-mkosi-bootctl-update-hook")
-            with open(bootctl_update_hook, "w") as f:
-                f.write(
-                    dedent(
-                        """\
-                        [Trigger]
-                        Operation = Upgrade
-                        Type = Package
-                        Target = systemd
-
-                        [Action]
-                        Description = Updating systemd-boot...
-                        When = PostTransaction
-                        Exec = /usr/bin/bootctl update
-                        """
-                    )
-                )
-
-        if args.bios_partno is not None:
-            vmlinuz_add_hook = os.path.join(hooks_dir, "90-mkosi-vmlinuz-add.hook")
-            with open(vmlinuz_add_hook, "w") as f:
-                f.write(
-                    """\
-                    [Trigger]
-                    Operation = Install
-                    Operation = Upgrade
-                    Type = Path
-                    Target = usr/lib/modules/*/vmlinuz
-
-                    [Action]
-                    Description = Adding vmlinuz to /boot...
-                    When = PostTransaction
-                    Exec = /bin/bash -c 'while read -r f; do install -Dm644 "$f" "/boot/vmlinuz-$(basename "$(dirname "$f")")"; done'
-                    NeedsTargets
-                    """
-                )
-
-            make_executable(vmlinuz_add_hook)
-
-            vmlinuz_remove_hook = os.path.join(hooks_dir, "60-mkosi-vmlinuz-remove.hook")
-            with open(vmlinuz_remove_hook, "w") as f:
-                f.write(
-                    """\
-                    [Trigger]
-                    Operation = Upgrade
-                    Operation = Remove
-                    Type = Path
-                    Target = usr/lib/modules/*/vmlinuz
-
-                    [Action]
-                    Description = Removing vmlinuz from /boot...
-                    When = PreTransaction
-                    Exec = /bin/bash -c 'while read -r f; do rm -f "/boot/vmlinuz-$(basename "$(dirname "$f")")"; done'
-                    NeedsTargets
-                    """
-                )
-
-            make_executable(vmlinuz_remove_hook)
-
-    keyring = "archlinux"
-    if platform.machine() == "aarch64":
-        keyring += "arm"
-
-    packages = {"base"}
-
-    if not do_run_build_script and args.bootable:
-        if args.output_format == OutputFormat.gpt_btrfs:
-            packages.add("btrfs-progs")
-        elif args.output_format == OutputFormat.gpt_xfs:
-            packages.add("xfsprogs")
-        if args.encrypt:
-            packages.add("cryptsetup")
-            packages.add("device-mapper")
-        if args.bios_partno:
-            packages.add("grub")
-
-        packages.add("dracut")
-        packages.add("binutils")
-
-        configure_dracut(args, root)
-
-    packages.update(args.packages)
-
-    official_kernel_packages = {
-        "linux",
-        "linux-lts",
-        "linux-hardened",
-        "linux-zen",
-    }
-
-    has_kernel_package = official_kernel_packages.intersection(args.packages)
-    if not do_run_build_script and args.bootable and not has_kernel_package:
-        # No user-specified kernel
-        packages.add("linux")
-
-    if do_run_build_script:
-        packages.update(args.build_packages)
-
-    if not do_run_build_script and args.ssh:
-        packages.add("openssh")
-
-    def run_pacman(packages: Set[str]) -> None:
-        conf = ["--config", pacman_conf]
-
-        try:
-            run(["pacman-key", *conf, "--init"])
-            run(["pacman-key", *conf, "--populate"])
-            run(["pacman", *conf, "--noconfirm", "-Sy", *packages])
-        finally:
-            # Kill the gpg-agent started by pacman and pacman-key.
-            run(["gpgconf", "--homedir", os.path.join(root, "etc/pacman.d/gnupg"), "--kill", "all"])
-
-    with mount_api_vfs(args, root):
-        run_pacman(packages)
-
-    # If /etc/locale.gen exists, uncomment the desired locale and leave the rest of the file untouched.
-    # If it doesn’t exist, just write the desired locale in it.
-    try:
-
-        def _enable_locale(line: str) -> str:
-            if line.startswith("#en_US.UTF-8"):
-                return line.replace("#", "")
-            return line
-
-        patch_file(os.path.join(root, "etc/locale.gen"), _enable_locale)
-
-    except FileNotFoundError:
-        with open(os.path.join(root, "etc/locale.gen"), "x") as f:
-            f.write("en_US.UTF-8 UTF-8\n")
-
-    run_workspace_command(args, root, ["/usr/bin/locale-gen"])
-
-    with open(os.path.join(root, "etc/locale.conf"), "w") as f:
-        f.write("LANG=en_US.UTF-8\n")
-
-    # Arch still uses pam_securetty which prevents root login into
-    # systemd-nspawn containers. See https://bugs.archlinux.org/task/45903.
-    disable_pam_securetty(root)
 
 
-@complete_step("Installing openSUSE")
-def install_opensuse(args: CommandLineArguments, root: str, do_run_build_script: bool) -> None:
-    release = args.release.strip('"')
+def find_and_install_shim_binary(
+    context: Context,
+    name: str,
+    signed: Sequence[str],
+    unsigned: Sequence[str],
+    output: Path,
+) -> None:
+    if context.config.shim_bootloader == ShimBootloader.signed:
+        for pattern in signed:
+            for p in context.root.glob(pattern):
+                if p.is_symlink() and p.readlink().is_absolute():
+                    logging.warning(f"Ignoring signed {name} EFI binary which is an absolute path to {p.readlink()}")
+                    continue
 
-    # If the release looks like a timestamp, it's Tumbleweed. 13.x is legacy (14.x won't ever appear). For
-    # anything else, let's default to Leap.
-    if release.isdigit() or release == "tumbleweed":
-        release_url = f"{args.mirror}/tumbleweed/repo/oss/"
-        updates_url = f"{args.mirror}/update/tumbleweed/"
-    elif release == "leap":
-        release_url = f"{args.mirror}/distribution/leap/15.1/repo/oss/"
-        updates_url = f"{args.mirror}/update/leap/15.1/oss/"
-    elif release == "current":
-        release_url = f"{args.mirror}/distribution/openSUSE-stable/repo/oss/"
-        updates_url = f"{args.mirror}/update/openSUSE-current/"
-    elif release == "stable":
-        release_url = f"{args.mirror}/distribution/openSUSE-stable/repo/oss/"
-        updates_url = f"{args.mirror}/update/openSUSE-stable/"
+                rel = p.relative_to(context.root)
+                if (context.root / output).is_dir():
+                    output /= rel.name
+
+                log_step(f"Installing signed {name} EFI binary from /{rel} to /{output}")
+                shutil.copy2(p, context.root / output)
+                return
+
+        if context.config.bootable == ConfigFeature.enabled:
+            die(f"Couldn't find signed {name} EFI binary installed in the image")
     else:
-        release_url = f"{args.mirror}/distribution/leap/{release}/repo/oss/"
-        updates_url = f"{args.mirror}/update/leap/{release}/oss/"
+        for pattern in unsigned:
+            for p in context.root.glob(pattern):
+                if p.is_symlink() and p.readlink().is_absolute():
+                    logging.warning(f"Ignoring unsigned {name} EFI binary which is an absolute path to {p.readlink()}")
+                    continue
 
-    # Configure the repositories: we need to enable packages caching here to make sure that the package cache
-    # stays populated after "zypper install".
-    run(["zypper", "--root", root, "addrepo", "-ck", release_url, "repo-oss"])
-    run(["zypper", "--root", root, "addrepo", "-ck", updates_url, "repo-update"])
+                rel = p.relative_to(context.root)
+                if (context.root / output).is_dir():
+                    output /= rel.name
 
-    if not args.with_docs:
-        with open(os.path.join(root, "etc/zypp/zypp.conf"), "w") as f:
-            f.write("rpm.install.excludedocs = yes\n")
+                if context.config.secure_boot:
+                    log_step(f"Signing and installing unsigned {name} EFI binary from /{rel} to /{output}")
+                    sign_efi_binary(context, p, context.root / output)
+                else:
+                    log_step(f"Installing unsigned {name} EFI binary /{rel} to /{output}")
+                    shutil.copy2(p, context.root / output)
 
-    packages = {"systemd", *args.packages}
+                return
 
-    if release.startswith("42."):
-        packages.add("patterns-openSUSE-minimal_base")
-    else:
-        packages.add("patterns-base-minimal_base")
+        if context.config.bootable == ConfigFeature.enabled:
+            die(f"Couldn't find unsigned {name} EFI binary installed in the image")
 
-    if not do_run_build_script and args.bootable:
-        packages.add("kernel-default")
-        packages.add("dracut")
-        packages.add("binutils")
 
-        configure_dracut(args, root)
+def install_shim(context: Context) -> None:
+    if not want_efi(context.config):
+        return
 
-        if args.bios_partno is not None:
-            packages.add("grub2")
+    if context.config.shim_bootloader == ShimBootloader.none:
+        return
 
-    if not do_run_build_script and args.encrypt:
-        packages.add("device-mapper")
+    if not any(gen_kernel_images(context)) and context.config.bootable == ConfigFeature.auto:
+        return
 
-    if args.output_format in (OutputFormat.subvolume, OutputFormat.gpt_btrfs):
-        packages.add("btrfsprogs")
+    dst = efi_boot_binary(context)
+    with umask(~0o700):
+        (context.root / dst).parent.mkdir(parents=True, exist_ok=True)
 
-    if do_run_build_script:
-        packages.update(args.build_packages)
+    arch = context.config.architecture.to_efi()
 
-    if not do_run_build_script and args.ssh:
-        packages.update("openssh-server")
-
-    cmdline = [
-        "zypper",
-        "--root",
-        root,
-        "--gpg-auto-import-keys",
-        "install",
-        "-y",
-        "--no-recommends",
-        "--download-in-advance",
-        *packages,
+    signed = [
+        f"usr/lib/shim/shim{arch}.efi.signed.latest", # Ubuntu
+        f"usr/lib/shim/shim{arch}.efi.signed", # Debian
+        f"boot/efi/EFI/*/shim{arch}.efi", # Fedora/CentOS
+        "usr/share/efi/*/shim.efi", # OpenSUSE
     ]
 
-    with mount_api_vfs(args, root):
-        run(cmdline)
-
-    # Disable packages caching in the image that was enabled previously to populate the package cache.
-    run(["zypper", "--root", root, "modifyrepo", "-K", "repo-oss"])
-    run(["zypper", "--root", root, "modifyrepo", "-K", "repo-update"])
-
-    if args.password == "":
-        shutil.copy2(os.path.join(root, "usr/etc/pam.d/common-auth"), os.path.join(root, "etc/pam.d/common-auth"))
-
-        def jj(line: str) -> str:
-            if "pam_unix.so" in line:
-                return f"{line.strip()} nullok"
-            return line
-
-        patch_file(os.path.join(root, "etc/pam.d/common-auth"), jj)
-
-
-def install_distribution(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    if cached:
-        return
-
-    install: Dict[Distribution, Callable[[CommandLineArguments, str, bool], None]] = {
-        Distribution.fedora: install_fedora,
-        Distribution.centos: install_centos,
-        Distribution.centos_epel: install_centos,
-        Distribution.mageia: install_mageia,
-        Distribution.debian: install_debian,
-        Distribution.ubuntu: install_ubuntu,
-        Distribution.arch: install_arch,
-        Distribution.opensuse: install_opensuse,
-        Distribution.clear: install_clear,
-        Distribution.photon: install_photon,
-        Distribution.openmandriva: install_openmandriva,
-    }
-
-    disable_kernel_install(args, root)
-
-    with mount_cache(args, root):
-        install[args.distribution](args, root, do_run_build_script)
-
-    reenable_kernel_install(args, root)
-
-
-def reset_machine_id(args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool) -> None:
-    """Make /etc/machine-id an empty file.
-
-    This way, on the next boot is either initialized and committed (if /etc is
-    writable) or the image runs with a transient machine ID, that changes on
-    each boot (if the image is read-only).
-    """
-
-    if do_run_build_script:
-        return
-    if for_cache:
-        return
-
-    with complete_step("Resetting machine ID"):
-        machine_id = os.path.join(root, "etc/machine-id")
-        try:
-            os.unlink(machine_id)
-        except FileNotFoundError:
-            pass
-        open(machine_id, "w+b").close()
-        dbus_machine_id = os.path.join(root, "var/lib/dbus/machine-id")
-        try:
-            os.unlink(dbus_machine_id)
-        except FileNotFoundError:
-            pass
-        else:
-            os.symlink("../../../etc/machine-id", dbus_machine_id)
-
-
-def reset_random_seed(args: CommandLineArguments, root: str) -> None:
-    """Remove random seed file, so that it is initialized on first boot"""
-    random_seed = os.path.join(root, "var/lib/systemd/random-seed")
-    if not os.path.exists(random_seed):
-        return
-
-    with complete_step("Removing random seed"):
-        os.unlink(random_seed)
-
-
-def set_root_password(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    "Set the root account password, or just delete it so it's easy to log in"
-
-    if do_run_build_script:
-        return
-    if cached:
-        return
-
-    if args.password == "":
-        with complete_step("Deleting root password"):
-
-            def jj(line: str) -> str:
-                if line.startswith("root:"):
-                    return ":".join(["root", ""] + line.split(":")[2:])
-                return line
-
-            patch_file(os.path.join(root, "etc/passwd"), jj)
-    elif args.password:
-        with complete_step("Setting root password"):
-            if args.password_is_hashed:
-                password = args.password
-            else:
-                password = crypt.crypt(args.password, crypt.mksalt(crypt.METHOD_SHA512))
-
-            def jj(line: str) -> str:
-                if line.startswith("root:"):
-                    return ":".join(["root", password] + line.split(":")[2:])
-                return line
-
-            patch_file(os.path.join(root, "etc/shadow"), jj)
-
-
-def pam_add_autologin(root: str, tty: str) -> None:
-    with open(os.path.join(root, "etc/pam.d/login"), "r+") as f:
-        original = f.read()
-        f.seek(0)
-        f.write(f"auth sufficient pam_succeed_if.so tty = {tty}\n")
-        f.write(original)
-
-
-def set_autologin(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    if do_run_build_script or cached or not args.autologin:
-        return
-
-    with complete_step("Setting up autologin"):
-        # On Debian, PAM wants the full path to the console device or it will refuse access
-        device_prefix = "/dev/" if args.distribution is Distribution.debian else ""
-
-        override_dir = os.path.join(root, "etc/systemd/system/console-getty.service.d")
-        os.makedirs(override_dir, mode=0o755, exist_ok=True)
-
-        override_file = os.path.join(override_dir, "autologin.conf")
-        with open(override_file, "w") as f:
-            f.write(
-                dedent(
-                    r"""
-                    [Service]
-                    ExecStart=
-                    ExecStart=-/sbin/agetty -o '-p -- \\u' --noclear --autologin root --keep-baud console 115200,38400,9600 $TERM
-                    """
-                )
-            )
-
-        os.chmod(override_file, 0o644)
-
-        pam_add_autologin(root, f"{device_prefix}pts/0")
-
-        override_dir = os.path.join(root, "etc/systemd/system/serial-getty@ttyS0.service.d")
-        os.makedirs(override_dir, mode=0o755, exist_ok=True)
-
-        override_file = os.path.join(override_dir, "autologin.conf")
-        with open(override_file, "w") as f:
-            f.write(
-                dedent(
-                    r"""
-                    [Service]
-                    ExecStart=
-                    ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin root --keep-baud 115200,57600,38400,9600 %I $TERM
-                    """
-                )
-            )
-
-        os.chmod(override_file, 0o644)
-
-        pam_add_autologin(root, f"{device_prefix}ttyS0")
-
-        override_dir = os.path.join(root, "etc/systemd/system/getty@tty1.service.d")
-        os.makedirs(override_dir, mode=0o755, exist_ok=True)
-
-        override_file = os.path.join(override_dir, "autologin.conf")
-        with open(override_file, "w") as f:
-            f.write(
-                dedent(
-                    r"""
-                    [Service]
-                    ExecStart=
-                    ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin root --noclear %I $TERM
-                    """
-                )
-            )
-
-        os.chmod(override_file, 0o644)
-
-        pam_add_autologin(root, f"{device_prefix}tty1")
-        pam_add_autologin(root, f"{device_prefix}console")
-
-
-def set_serial_terminal(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    """Override TERM for the serial console with the terminal type from the host."""
-
-    if do_run_build_script or cached or not args.qemu_headless:
-        return
-
-    with complete_step("Configuring serial tty (ttyS0)"):
-        override_dir = os.path.join(root, "etc/systemd/system/serial-getty@ttyS0.service.d")
-        os.makedirs(override_dir, mode=0o755, exist_ok=True)
-
-        columns, lines = shutil.get_terminal_size(fallback=(80, 24))
-        override_file = os.path.join(override_dir, "term.conf")
-        with open(override_file, "w") as f:
-            f.write(
-                dedent(
-                    f"""
-                    [Service]
-                    Environment=TERM={os.getenv('TERM', 'vt220')}
-                    Environment=COLUMNS={columns}
-                    Environment=LINES={lines}
-                    """
-                )
-            )
-
-        os.chmod(override_file, 0o644)
-
-
-def nspawn_params_for_build_sources(args: CommandLineArguments, sft: SourceFileTransfer) -> List[str]:
-    params = []
-
-    if args.build_sources is not None:
-        params.append("--setenv=SRCDIR=/root/src")
-        params.append("--chdir=/root/src")
-        if sft == SourceFileTransfer.mount:
-            params.append("--bind=" + args.build_sources + ":/root/src")
-
-        if args.read_only:
-            params.append("--overlay=+/root/src::/root/src")
-    else:
-        params.append("--chdir=/root")
-
-    return params
-
-
-def run_prepare_script(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    if args.prepare_script is None:
-        return
-    if cached:
-        return
-
-    verb = "build" if do_run_build_script else "final"
-
-    with mount_cache(args, root), complete_step("Running prepare script"):
-
-        # We copy the prepare script into the build tree. We'd prefer
-        # mounting it into the tree, but for that we'd need a good
-        # place to mount it to. But if we create that we might as well
-        # just copy the file anyway.
-
-        shutil.copy2(args.prepare_script, os.path.join(root, "root/prepare"))
-
-        nspawn_params = nspawn_params_for_build_sources(args, SourceFileTransfer.mount)
-        run_workspace_command(args, root, ["/root/prepare", verb], network=True, nspawn_params=nspawn_params)
-
-        if os.path.exists(os.path.join(root, "root/src")):
-            os.rmdir(os.path.join(root, "root/src"))
-        os.unlink(os.path.join(root, "root/prepare"))
-
-
-def run_postinst_script(
-    args: CommandLineArguments, root: str, loopdev: Optional[str], do_run_build_script: bool, for_cache: bool
-) -> None:
-    if args.postinst_script is None:
-        return
-    if for_cache:
-        return
-
-    verb = "build" if do_run_build_script else "final"
-
-    with mount_cache(args, root), complete_step("Running postinstall script"):
-
-        # We copy the postinst script into the build tree. We'd prefer
-        # mounting it into the tree, but for that we'd need a good
-        # place to mount it to. But if we create that we might as well
-        # just copy the file anyway.
-
-        shutil.copy2(args.postinst_script, os.path.join(root, "root/postinst"))
-
-        nspawn_params = []
-        # in order to have full blockdev access, i.e. for making grub2 bootloader changes
-        # we need to have these bind mounts for a proper chroot setup
-        if args.bootable:
-            if loopdev is None:
-                raise ValueError("Parameter 'loopdev' required for bootable images.")
-            nspawn_params += nspawn_params_for_blockdev_access(args, loopdev)
-
-        run_workspace_command(
-            args, root, ["/root/postinst", verb], network=args.with_network, nspawn_params=nspawn_params
-        )
-        os.unlink(os.path.join(root, "root/postinst"))
-
-
-def output_dir(args: CommandLineArguments) -> str:
-    return args.output_dir or os.getcwd()
-
-
-def run_finalize_script(args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool) -> None:
-    if args.finalize_script is None:
-        return
-    if for_cache:
-        return
-
-    verb = "build" if do_run_build_script else "final"
-
-    with complete_step("Running finalize script"):
-        env = collections.ChainMap({"BUILDROOT": root, "OUTPUTDIR": output_dir(args)}, os.environ)
-        run([args.finalize_script, verb], env=env)
-
-
-def nspawn_params_for_blockdev_access(args: CommandLineArguments, loopdev: str) -> List[str]:
-    params = [
-        f"--bind-ro={loopdev}",
-        f"--bind-ro=/dev/block",
-        f"--bind-ro=/dev/disk",
-        f"--property=DeviceAllow={loopdev}",
+    unsigned = [
+        f"usr/lib/shim/shim{arch}.efi", # Debian/Ubuntu
+        f"usr/share/shim/*/*/shim{arch}.efi", # Fedora/CentOS
+        f"usr/share/shim/shim{arch}.efi", # Arch
     ]
-    for partno in (args.esp_partno, args.bios_partno, args.root_partno, args.xbootldr_partno):
-        if partno is not None:
-            p = partition(loopdev, partno)
-            if os.path.exists(p):
-                params += [f"--bind-ro={p}", f"--property=DeviceAllow={p}"]
-    return params
 
+    find_and_install_shim_binary(context, "shim", signed, unsigned, dst)
 
-def write_grub_config(args: CommandLineArguments, root: str) -> None:
-    kernel_cmd_line = " ".join(args.kernel_command_line)
-    grub_cmdline = f'GRUB_CMDLINE_LINUX="{kernel_cmd_line}"\n'
-    os.makedirs(os.path.join(root, "etc/default"), exist_ok=True, mode=0o755)
-    grub_config = os.path.join(root, "etc/default/grub")
-    if not os.path.exists(grub_config):
-        with open(grub_config, "w+") as f:
-            f.write(grub_cmdline)
-    else:
+    signed = [
+        f"usr/lib/shim/mm{arch}.efi.signed", # Debian
+        f"usr/lib/shim/mm{arch}.efi", # Ubuntu
+        f"boot/efi/EFI/*/mm{arch}.efi", # Fedora/CentOS
+        "usr/share/efi/*/MokManager.efi", # OpenSUSE
+    ]
 
-        def jj(line: str) -> str:
-            if line.startswith("GRUB_CMDLINE_LINUX="):
-                return grub_cmdline
-            if args.qemu_headless:
-                if "GRUB_TERMINAL_INPUT" in line:
-                    return 'GRUB_TERMINAL_INPUT="console serial"'
-                if "GRUB_TERMINAL_OUTPUT" in line:
-                    return 'GRUB_TERMINAL_OUTPUT="console serial"'
-            return line
+    unsigned = [
+        f"usr/lib/shim/mm{arch}.efi", # Debian/Ubuntu
+        f"usr/share/shim/*/*/mm{arch}.efi", # Fedora/CentOS
+        f"usr/share/shim/mm{arch}.efi", # Arch
+    ]
 
-        patch_file(grub_config, jj)
+    find_and_install_shim_binary(context, "mok", signed, unsigned, dst.parent)
 
-        if args.qemu_headless:
-            with open(grub_config, "a") as f:
-                f.write('GRUB_SERIAL_COMMAND="serial --unit=0 --speed 115200"\n')
 
-
-def install_grub(args: CommandLineArguments, root: str, loopdev: str, grub: str) -> None:
-    if args.bios_partno is None:
-        return
-
-    write_grub_config(args, root)
-
-    nspawn_params = nspawn_params_for_blockdev_access(args, loopdev)
-
-    cmdline = [f"{grub}-install", "--modules=ext2 part_gpt", "--target=i386-pc", loopdev]
-    run_workspace_command(args, root, cmdline, nspawn_params=nspawn_params)
-
-    # TODO: Remove os.path.basename once https://github.com/systemd/systemd/pull/16645 is widely available.
-    cmdline = [f"{grub}-mkconfig", f"--output=/boot/{os.path.basename(grub)}/grub.cfg"]
-    run_workspace_command(args, root, cmdline, nspawn_params=nspawn_params)
-
-
-def install_boot_loader_clear(args: CommandLineArguments, root: str, loopdev: str) -> None:
-    # clr-boot-manager uses blkid in the device backing "/" to
-    # figure out uuid and related parameters.
-    nspawn_params = nspawn_params_for_blockdev_access(args, loopdev)
-
-    cmdline = ["/usr/bin/clr-boot-manager", "update", "-i"]
-    run_workspace_command(args, root, cmdline, nspawn_params=nspawn_params)
-
-
-def install_boot_loader_centos_old_efi(args: CommandLineArguments, root: str, loopdev: str) -> None:
-    nspawn_params = nspawn_params_for_blockdev_access(args, loopdev)
-
-    # prepare EFI directory on ESP
-    os.makedirs(os.path.join(root, "efi/EFI/centos"), exist_ok=True)
-
-    # patch existing or create minimal GRUB_CMDLINE config
-    write_grub_config(args, root)
-
-    # generate grub2 efi boot config
-    cmdline = ["/sbin/grub2-mkconfig", "-o", "/efi/EFI/centos/grub.cfg"]
-    run_workspace_command(args, root, cmdline, nspawn_params=nspawn_params)
-
-    # if /sys/firmware/efi is not present within systemd-nspawn the grub2-mkconfig makes false assumptions, let's fix this
-    def _fix_grub(line: str) -> str:
-        if "linux16" in line:
-            return line.replace("linux16", "linuxefi")
-        elif "initrd16" in line:
-            return line.replace("initrd16", "initrdefi")
-        return line
-
-    patch_file(os.path.join(root, "efi/EFI/centos/grub.cfg"), _fix_grub)
-
-
-def install_boot_loader(
-    args: CommandLineArguments, root: str, loopdev: Optional[str], do_run_build_script: bool, cached: bool
-) -> None:
-    if not args.bootable or do_run_build_script:
-        return
-    assert loopdev is not None
-
-    if cached:
-        return
-
-    with complete_step("Installing boot loader"):
-        if args.esp_partno:
-            if args.distribution == Distribution.clear:
-                pass
-            elif args.distribution in (Distribution.centos, Distribution.centos_epel) and is_older_than_centos8(
-                args.release
-            ):
-                install_boot_loader_centos_old_efi(args, root, loopdev)
-            else:
-                run_workspace_command(args, root, ["bootctl", "install"])
-
-        if args.bios_partno and args.distribution != Distribution.clear:
-            grub = (
-                "grub"
-                if args.distribution in (Distribution.ubuntu, Distribution.debian, Distribution.arch)
-                else "grub2"
-            )
-            # TODO: Just use "grub" once https://github.com/systemd/systemd/pull/16645 is widely available.
-            if args.distribution in (Distribution.ubuntu, Distribution.debian, Distribution.opensuse):
-                grub = f"/usr/sbin/{grub}"
-
-            install_grub(args, root, loopdev, grub)
-
-        if args.distribution == Distribution.clear:
-            install_boot_loader_clear(args, root, loopdev)
-
-
-def install_extra_trees(args: CommandLineArguments, root: str, for_cache: bool) -> None:
-    if not args.extra_trees:
-        return
-
-    if for_cache:
-        return
-
-    with complete_step("Copying in extra file trees"):
-        for d in args.extra_trees:
-            if os.path.isdir(d):
-                copy_path(d, root)
-            else:
-                shutil.unpack_archive(d, root)
-
-
-def install_skeleton_trees(args: CommandLineArguments, root: str, for_cache: bool) -> None:
-    if not args.skeleton_trees:
-        return
-
-    with complete_step("Copying in skeleton file trees"):
-        for d in args.skeleton_trees:
-            if os.path.isdir(d):
-                copy_path(d, root)
-            else:
-                shutil.unpack_archive(d, root)
-
-
-def copy_git_files(src: str, dest: str, *, source_file_transfer: SourceFileTransfer) -> None:
-    what_files = ["--exclude-standard", "--cached"]
-    if source_file_transfer == SourceFileTransfer.copy_git_others:
-        what_files += ["--others", "--exclude=.mkosi-*"]
-
-    c = run(["git", "-C", src, "ls-files", "-z"] + what_files, stdout=PIPE, universal_newlines=False, check=True)
-    files = {x.decode("utf-8") for x in c.stdout.rstrip(b"\0").split(b"\0")}
-
-    # Add the .git/ directory in as well.
-    if source_file_transfer == SourceFileTransfer.copy_git_more:
-        # r=root, d=directories, f=files
-        top = os.path.join(src, ".git/")
-        for r, d, f in os.walk(top):
-            for fh in f:
-                fp = os.path.join(r, fh)  # full path
-                fr = os.path.join(".git/", fp[len(top) :])  # relative to top
-                files.add(fr)
-
-    # Get submodule files
-    c = run(["git", "-C", src, "submodule", "status", "--recursive"], stdout=PIPE, universal_newlines=True, check=True)
-    submodules = {x.split()[1] for x in c.stdout.splitlines()}
-
-    # workaround for git-ls-files returning the path of submodules that we will
-    # still parse
-    files -= submodules
-
-    for sm in submodules:
-        c = run(
-            ["git", "-C", os.path.join(src, sm), "ls-files", "-z"] + what_files,
-            stdout=PIPE,
-            universal_newlines=False,
-            check=True,
-        )
-        files |= {os.path.join(sm, x.decode("utf-8")) for x in c.stdout.rstrip(b"\0").split(b"\0")}
-        files -= submodules
-
-    del c
-
-    for path in files:
-        src_path = os.path.join(src, path)
-        dest_path = os.path.join(dest, path)
-
-        directory = os.path.dirname(dest_path)
-        os.makedirs(directory, exist_ok=True)
-
-        copy_file(src_path, dest_path)
-
-
-def install_build_src(args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool) -> None:
-    if for_cache:
-        return
-
-    if args.build_script is None:
-        return
-
-    if do_run_build_script:
-        with complete_step("Copying in build script"):
-            copy_file(args.build_script, os.path.join(root, "root", os.path.basename(args.build_script)))
-
-    if do_run_build_script:
-        sft = args.source_file_transfer
-    else:
-        sft = args.source_file_transfer_final
-
-    if args.build_sources is None or sft is None:
-        return
-
-    with complete_step("Copying in sources"):
-        target = os.path.join(root, "root/src")
-
-        if sft in (
-            SourceFileTransfer.copy_git_others,
-            SourceFileTransfer.copy_git_cached,
-            SourceFileTransfer.copy_git_more,
-        ):
-            copy_git_files(args.build_sources, target, source_file_transfer=sft)
-        elif sft == SourceFileTransfer.copy_all:
-            ignore = shutil.ignore_patterns(
-                ".git",
-                ".mkosi-*",
-                "*.cache-pre-dev",
-                "*.cache-pre-inst",
-                os.path.basename(args.output_dir) + "/" if args.output_dir else "mkosi.output/",
-                os.path.basename(args.cache_path) + "/" if args.cache_path else "mkosi.cache/",
-                os.path.basename(args.build_dir) + "/" if args.build_dir else "mkosi.builddir/",
-                os.path.basename(args.include_dir) + "/" if args.include_dir else "mkosi.includedir/",
-                os.path.basename(args.install_dir) + "/" if args.install_dir else "mkosi.installdir/",
-            )
-            shutil.copytree(args.build_sources, target, symlinks=True, ignore=ignore)
-
-
-def install_build_dest(args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool) -> None:
-    if do_run_build_script:
-        return
-    if for_cache:
-        return
-
-    if args.build_script is None:
-        return
-
-    with complete_step("Copying in build tree"):
-        copy_path(install_dir(args, root), root)
-
-
-def make_read_only(args: CommandLineArguments, root: str, for_cache: bool, b: bool = True) -> None:
-    if not args.read_only:
-        return
-    if for_cache:
-        return
-
-    if args.output_format not in (OutputFormat.gpt_btrfs, OutputFormat.subvolume):
-        return
-
-    with complete_step("Marking root subvolume read-only"):
-        btrfs_subvol_make_ro(root, b)
-
-
-def make_tar(args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool) -> Optional[BinaryIO]:
-    if do_run_build_script:
-        return None
-    if args.output_format != OutputFormat.tar:
-        return None
-    if for_cache:
-        return None
-
-    with complete_step("Creating archive"):
-        f: BinaryIO = cast(BinaryIO, tempfile.NamedTemporaryFile(dir=os.path.dirname(args.output), prefix=".mkosi-"))
-        # OpenMandriva defaults to bsdtar(libarchive) which uses POSIX argument list so let's keep a separate list
-        if shutil.which("bsdtar") and args.distribution == Distribution.openmandriva:
-            _tar_cmd = ["bsdtar", "-C", root, "-c", "-J", "--xattrs", "-f", "-", "."]
-        else:
-            _tar_cmd = ["tar", "-C", root, "-c", "-J", "--xattrs", "--xattrs-include=*"]
-            if args.tar_strip_selinux_context:
-                _tar_cmd.append("--xattrs-exclude=security.selinux")
-            _tar_cmd.append(".")
-
-        run(_tar_cmd, env={"XZ_OPT": "-T0"}, stdout=f)
-
-    return f
-
-
-def make_squashfs(args: CommandLineArguments, root: str, for_cache: bool) -> Optional[BinaryIO]:
-    if not args.output_format.is_squashfs():
-        return None
-    if for_cache:
-        return None
-
-    command = args.mksquashfs_tool[0] if args.mksquashfs_tool else "mksquashfs"
-    comp_args = args.mksquashfs_tool[1:] if args.mksquashfs_tool and args.mksquashfs_tool[1:] else ["-noappend"]
-
-    if args.compress is not True:
-        assert args.compress is not False
-        comp_args += ["-comp", args.compress]
-
-    with complete_step("Creating squashfs file system"):
-        f: BinaryIO = cast(
-            BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-squashfs", dir=os.path.dirname(args.output))
-        )
-        run([command, root, f.name, *comp_args])
-
-    return f
-
-
-def make_minimal_ext4(args: CommandLineArguments, root: str, for_cache: bool) -> Optional[BinaryIO]:
-    if args.output_format != OutputFormat.gpt_ext4:
-        return None
-    if not args.minimize:
-        return None
-    if for_cache:
-        return None
-
-    with complete_step("Creating ext4 root file system"):
-        f: BinaryIO = cast(
-            BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-mkfs-ext4", dir=os.path.dirname(args.output))
-        )
-        f.truncate(args.root_size)
-        run(["mkfs.ext4", "-I", "256", "-L", "root", "-M", "/", "-d", root, f.name])
-
-    with complete_step("Minimizing ext4 root file system"):
-        run(["resize2fs", "-M", f.name])
-
-    return f
-
-
-def make_minimal_btrfs(args: CommandLineArguments, root: str, for_cache: bool) -> Optional[BinaryIO]:
-    if args.output_format != OutputFormat.gpt_btrfs:
-        return None
-    if not args.minimize:
-        return None
-    if for_cache:
-        return None
-
-    with complete_step("Creating minimal btrfs root file system"):
-        f: BinaryIO = cast(
-            BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-mkfs-btrfs", dir=os.path.dirname(args.output))
-        )
-        f.truncate(args.root_size)
-
-        command = ["mkfs.btrfs", "-L", "root", "-d", "single", "-m", "single", "--shrink", "--rootdir", root, f.name]
-        try:
-            run(command)
-        except subprocess.CalledProcessError:
-            # The --shrink option was added in btrfs-tools 4.14.1, before that it was the default behaviour.
-            # If the above fails, let's see if things work if we drop it
-            command.remove("--shrink")
-            run(command)
-
-    return f
-
-
-def make_generated_root(args: CommandLineArguments, root: str, for_cache: bool) -> Optional[BinaryIO]:
-
-    if args.output_format == OutputFormat.gpt_ext4:
-        return make_minimal_ext4(args, root, for_cache)
-    if args.output_format == OutputFormat.gpt_btrfs:
-        return make_minimal_btrfs(args, root, for_cache)
-    if args.output_format.is_squashfs():
-        return make_squashfs(args, root, for_cache)
+def find_grub_directory(context: Context, *, target: str) -> Optional[Path]:
+    for d in ("usr/lib/grub", "usr/share/grub2"):
+        if (p := context.root / d / target).exists() and any(p.iterdir()):
+            return p
 
     return None
 
 
-def read_partition_table(loopdev: str) -> Tuple[List[str], int]:
-    table = []
-    last_sector = 0
+def find_grub_binary(config: Config, binary: str) -> Optional[Path]:
+    assert "grub" not in binary
+    return config.find_binary(f"grub-{binary}", f"grub2-{binary}")
 
-    c = run(["sfdisk", "--dump", loopdev], stdout=PIPE)
 
-    in_body = False
-    for line in c.stdout.decode("utf-8").split("\n"):
-        stripped = line.strip()
+def want_grub_efi(context: Context) -> bool:
+    if not want_efi(context.config):
+        return False
 
-        if stripped == "":  # empty line is where the body begins
-            in_body = True
+    if context.config.bootloader != Bootloader.grub:
+        return False
+
+    if context.config.shim_bootloader != ShimBootloader.signed:
+        have = find_grub_directory(context, target="x86_64-efi") is not None
+        if not have and context.config.bootable == ConfigFeature.enabled:
+            die("An EFI bootable image with grub was requested but grub for EFI is not installed")
+
+    return True
+
+
+def want_grub_bios(context: Context, partitions: Sequence[Partition] = ()) -> bool:
+    if context.config.bootable == ConfigFeature.disabled:
+        return False
+
+    if context.config.output_format != OutputFormat.disk:
+        return False
+
+    if context.config.bios_bootloader != BiosBootloader.grub:
+        return False
+
+    if context.config.overlay:
+        return False
+
+    have = find_grub_directory(context, target="i386-pc") is not None
+    if not have and context.config.bootable == ConfigFeature.enabled:
+        die("A BIOS bootable image with grub was requested but grub for BIOS is not installed")
+
+    bios = any(p.type == Partition.GRUB_BOOT_PARTITION_UUID for p in partitions)
+    if partitions and not bios and context.config.bootable == ConfigFeature.enabled:
+        die("A BIOS bootable image with grub was requested but no BIOS Boot Partition was configured")
+
+    esp = any(p.type == "esp" for p in partitions)
+    if partitions and not esp and context.config.bootable == ConfigFeature.enabled:
+        die("A BIOS bootable image with grub was requested but no ESP partition was configured")
+
+    root = any(p.type.startswith("root") or p.type.startswith("usr") for p in partitions)
+    if partitions and not root and context.config.bootable == ConfigFeature.enabled:
+        die("A BIOS bootable image with grub was requested but no root or usr partition was configured")
+
+    installed = True
+
+    for binary in ("mkimage", "bios-setup"):
+        if find_grub_binary(context.config, binary):
             continue
-        if not in_body:
+
+        if context.config.bootable == ConfigFeature.enabled:
+            die(f"A BIOS bootable image with grub was requested but {binary} was not found")
+
+        installed = False
+
+    return (have and bios and esp and root and installed) if partitions else have
+
+
+def prepare_grub_config(context: Context) -> Optional[Path]:
+    config = context.root / "efi" / context.config.distribution.grub_prefix() / "grub.cfg"
+    with umask(~0o700):
+        config.parent.mkdir(exist_ok=True)
+
+    # For some unknown reason, if we don't set the timeout to zero, grub never leaves its menu, so we default
+    # to a zero timeout, but only if the config file hasn't been provided by the user.
+    if not config.exists():
+        with umask(~0o600), config.open("w") as f:
+            f.write("set timeout=0\n")
+
+    if want_grub_efi(context):
+        # Signed EFI grub shipped by distributions reads its configuration from /EFI/<distribution>/grub.cfg (except
+        # in OpenSUSE) in the ESP so let's put a shim there to redirect to the actual configuration file.
+        if context.config.distribution == Distribution.opensuse:
+            earlyconfig = context.root / "efi/EFI/BOOT/grub.cfg"
+        else:
+            earlyconfig = context.root / "efi/EFI" / context.config.distribution.name / "grub.cfg"
+
+        with umask(~0o700):
+            earlyconfig.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read the actual config file from the root of the ESP.
+        earlyconfig.write_text(f"configfile /{context.config.distribution.grub_prefix()}/grub.cfg\n")
+
+    return config
+
+
+def grub_mkimage(
+    context: Context,
+    *,
+    target: str,
+    modules: Sequence[str] = (),
+    output: Optional[Path] = None,
+    sbat: Optional[Path] = None,
+) -> None:
+    mkimage = find_grub_binary(context.config, "mkimage")
+    assert mkimage
+
+    directory = find_grub_directory(context, target=target)
+    assert directory
+
+    with (
+        complete_step(f"Generating grub image for {target}"),
+        tempfile.NamedTemporaryFile("w", prefix="grub-early-config") as earlyconfig
+    ):
+        earlyconfig.write(
+            textwrap.dedent(
+                f"""\
+                search --no-floppy --set=root --file /{context.config.distribution.grub_prefix()}/grub.cfg
+                set prefix=($root)/{context.config.distribution.grub_prefix()}
+                """
+            )
+        )
+
+        earlyconfig.flush()
+
+        run(
+            [
+                mkimage,
+                "--directory", "/grub",
+                "--config", earlyconfig.name,
+                "--prefix", f"/{context.config.distribution.grub_prefix()}",
+                "--output", output or ("/grub/core.img"),
+                "--format", target,
+                *(["--sbat", str(sbat)] if sbat else []),
+                *(["--disable-shim-lock"] if context.config.shim_bootloader == ShimBootloader.none else []),
+                "cat",
+                "cmp",
+                "div",
+                "echo",
+                "fat",
+                "hello",
+                "help",
+                "keylayouts",
+                "linux",
+                "loadenv",
+                "ls",
+                "normal",
+                "part_gpt",
+                "read",
+                "reboot",
+                "search_fs_file",
+                "search",
+                "sleep",
+                "test",
+                "tr",
+                "true",
+                *modules,
+            ],
+            sandbox=context.sandbox(
+                binary=mkimage,
+                mounts=[
+                    Mount(directory, "/grub"),
+                    Mount(earlyconfig.name, earlyconfig.name, ro=True),
+                    *([Mount(output.parent, output.parent)] if output else []),
+                    *([Mount(str(sbat), str(sbat), ro=True)] if sbat else []),
+                ],
+            ),
+        )
+
+
+def find_signed_grub_image(context: Context) -> Optional[Path]:
+    arch = context.config.architecture.to_efi()
+
+    patterns = [
+        f"usr/lib/grub/*-signed/grub{arch}.efi.signed", # Debian/Ubuntu
+        f"boot/efi/EFI/*/grub{arch}.efi", # Fedora/CentOS
+        "usr/share/efi/*/grub.efi", # OpenSUSE
+    ]
+
+    for p in flatten(context.root.glob(pattern) for pattern in patterns):
+        if p.is_symlink() and p.readlink().is_absolute():
+            logging.warning(f"Ignoring signed grub EFI binary which is an absolute path to {p.readlink()}")
             continue
 
-        table.append(stripped)
+        return p
 
-        _, rest = stripped.split(":", 1)
-        fields = rest.split(",")
-
-        start = None
-        size = None
-
-        for field in fields:
-            f = field.strip()
-
-            if f.startswith("start="):
-                start = int(f[6:])
-            if f.startswith("size="):
-                size = int(f[5:])
-
-        if start is not None and size is not None:
-            end = start + size
-            if end > last_sector:
-                last_sector = end
-
-    return table, last_sector * 512
+    return None
 
 
-def insert_partition(
-    args: CommandLineArguments,
-    root: str,
-    raw: BinaryIO,
-    loopdev: str,
-    partno: int,
-    blob: BinaryIO,
-    name: str,
-    type_uuid: uuid.UUID,
-    read_only: bool,
-    uuid_opt: Optional[uuid.UUID] = None,
-) -> int:
-    if args.ran_sfdisk:
-        old_table, last_partition_sector = read_partition_table(loopdev)
+def install_grub(context: Context) -> None:
+    if not want_grub_bios(context) and not want_grub_efi(context):
+        return
+
+    if want_grub_bios(context):
+        grub_mkimage(context, target="i386-pc", modules=("biosdisk",))
+
+    if want_grub_efi(context):
+        if context.config.shim_bootloader != ShimBootloader.none:
+            output = context.root / shim_second_stage_binary(context)
+        else:
+            output = context.root / efi_boot_binary(context)
+
+        with umask(~0o700):
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+        if context.config.shim_bootloader == ShimBootloader.signed:
+            if not (signed := find_signed_grub_image(context)):
+                if context.config.bootable == ConfigFeature.enabled:
+                    die("Couldn't find a signed grub EFI binary installed in the image")
+
+                return
+
+            rel = output.relative_to(context.root)
+            log_step(f"Installing signed grub EFI binary from /{signed.relative_to(context.root)} to /{rel}")
+            shutil.copy2(signed, output)
+        else:
+            if context.config.secure_boot and context.config.shim_bootloader != ShimBootloader.none:
+                if not (signed := find_signed_grub_image(context)):
+                    die("Couldn't find a signed grub EFI binary installed in the image to extract SBAT from")
+
+                sbat = extract_pe_section(context, signed, ".sbat", context.workspace / "sbat")
+            else:
+                sbat = None
+
+            grub_mkimage(context, target="x86_64-efi", output=output, modules=("chain",), sbat=sbat)
+            if context.config.secure_boot:
+                sign_efi_binary(context, output, output)
+
+    dst = context.root / "efi" / context.config.distribution.grub_prefix() / "fonts"
+    with umask(~0o700):
+        dst.mkdir(parents=True, exist_ok=True)
+
+    for d in ("grub", "grub2"):
+        unicode = context.root / "usr/share" / d / "unicode.pf2"
+        if unicode.exists():
+            shutil.copy2(unicode, dst)
+
+
+def grub_bios_setup(context: Context, partitions: Sequence[Partition]) -> None:
+    if not want_grub_bios(context, partitions):
+        return
+
+    setup = find_grub_binary(context.config, "bios-setup")
+    assert setup
+
+    directory = find_grub_directory(context, target="i386-pc")
+    assert directory
+
+    with (
+        complete_step("Installing grub boot loader for BIOS…"),
+        tempfile.NamedTemporaryFile(mode="w") as mountinfo,
+    ):
+        # grub-bios-setup insists on being able to open the root device that --directory is located on, which
+        # needs root privileges. However, it only uses the root device when it is unable to embed itself in the
+        # bios boot partition. To make installation work unprivileged, we trick grub to think that the root
+        # device is our image by mounting over its /proc/self/mountinfo file (where it gets its information from)
+        # with our own file correlating the root directory to our image file.
+        mountinfo.write(f"1 0 1:1 / / - fat {context.staging / context.config.output_with_format}\n")
+        mountinfo.flush()
+
+        # We don't setup the mountinfo bind mount with bwrap because we need to know the child process pid to
+        # be able to do the mount and we don't know the pid beforehand.
+        run(
+            [
+                setup,
+                "--directory", "/grub",
+                context.staging / context.config.output_with_format,
+            ],
+            sandbox=context.sandbox(
+                binary=setup,
+                mounts=[
+                    Mount(directory, "/grub"),
+                    Mount(context.staging, context.staging),
+                    Mount(mountinfo.name, mountinfo.name),
+                ],
+                extra=["sh", "-c", f"mount --bind {mountinfo.name} /proc/$$/mountinfo && exec $0 \"$@\""],
+            ),
+        )
+
+
+def install_tree(
+    config: Config,
+    src: Path,
+    dst: Path,
+    *,
+    target: Optional[Path] = None,
+    preserve: bool = True,
+) -> None:
+    t = dst
+    if target:
+        t = dst / target.relative_to("/")
+
+    with umask(~0o755):
+        t.parent.mkdir(parents=True, exist_ok=True)
+
+    def copy() -> None:
+        copy_tree(
+            src, t,
+            preserve=preserve,
+            use_subvolumes=config.use_subvolumes,
+            sandbox=config.sandbox,
+        )
+
+    if src.is_dir() or (src.is_file() and target):
+        copy()
+    elif src.suffix == ".tar":
+        extract_tar(src, t, sandbox=config.sandbox)
+    elif src.suffix == ".raw":
+        run(
+            ["systemd-dissect", "--copy-from", src, "/", t],
+            sandbox=config.sandbox(
+                binary="systemd-dissect",
+                devices=True,
+                network=True,
+                mounts=[Mount(src, src, ro=True), Mount(t.parent, t.parent)],
+            ),
+        )
     else:
-        # No partition table yet? Then let's fake one...
-        old_table = []
-        last_partition_sector = GPT_HEADER_SIZE
+        # If we get an unknown file without a target, we just copy it into /.
+        copy()
 
-    blob_size = roundup512(os.stat(blob.name).st_size)
-    luks_extra = 2 * 1024 * 1024 if args.encrypt == "all" else 0
-    new_size = last_partition_sector + blob_size + luks_extra + GPT_FOOTER_SIZE
 
-    MkosiPrinter.print_step(f"Resizing disk image to {format_bytes(new_size)}...")
+def install_base_trees(context: Context) -> None:
+    if not context.config.base_trees or context.config.overlay:
+        return
 
-    os.truncate(raw.name, new_size)
-    run(["losetup", "--set-capacity", loopdev])
+    with complete_step("Copying in base trees…"):
+        for path in context.config.base_trees:
+            install_tree(context.config, path, context.root)
 
-    MkosiPrinter.print_step(f"Inserting partition of {format_bytes(blob_size)}...")
 
-    table = "label: gpt\n"
-    if args.gpt_first_lba is not None:
-        table += f"first-lba: {args.gpt_first_lba:d}\n"
+def install_skeleton_trees(context: Context) -> None:
+    if not context.config.skeleton_trees:
+        return
 
-    for t in old_table:
-        table += t + "\n"
+    with complete_step("Copying in skeleton file trees…"):
+        for tree in context.config.skeleton_trees:
+            install_tree(context.config, tree.source, context.root, target=tree.target, preserve=False)
 
-    if uuid_opt is not None:
-        table += "uuid=" + str(uuid_opt) + ", "
 
-    n_sectors = (blob_size + luks_extra) // 512
-    table += 'size={}, type={}, attrs={}, name="{}"\n'.format(
-        n_sectors, type_uuid, "GUID:60" if read_only else "", name
+def install_package_manager_trees(context: Context) -> None:
+    # Ensure /etc exists in the package manager tree
+    (context.pkgmngr / "etc").mkdir(exist_ok=True)
+
+    # Backwards compatibility symlink.
+    (context.pkgmngr / "etc/mtab").symlink_to("../proc/self/mounts")
+
+    # Required to be able to access certificates in the sandbox when running from nix.
+    if Path("/etc/static").is_symlink():
+        (context.pkgmngr / "etc/static").symlink_to(Path("/etc/static").readlink())
+
+    (context.pkgmngr / "var/log").mkdir(parents=True)
+
+    with (context.pkgmngr / "etc/passwd").open("w") as passwd:
+        passwd.write("root:x:0:0:root:/root:/bin/sh\n")
+        if INVOKING_USER.uid != 0:
+            name = INVOKING_USER.name()
+            home = INVOKING_USER.home()
+            passwd.write(f"{name}:x:{INVOKING_USER.uid}:{INVOKING_USER.gid}:{name}:{home}:/bin/sh\n")
+        os.fchown(passwd.fileno(), INVOKING_USER.uid, INVOKING_USER.gid)
+
+    with (context.pkgmngr / "etc/group").open("w") as group:
+        group.write("root:x:0:\n")
+        if INVOKING_USER.uid != 0:
+            group.write(f"{INVOKING_USER.name()}:x:{INVOKING_USER.gid}:\n")
+        os.fchown(group.fileno(), INVOKING_USER.uid, INVOKING_USER.gid)
+
+    if (p := context.config.tools() / "etc/crypto-policies").exists():
+        copy_tree(
+            p, context.pkgmngr / "etc/crypto-policies",
+            preserve=False,
+            dereference=True,
+            sandbox=context.config.sandbox,
+        )
+
+    if not context.config.package_manager_trees:
+        return
+
+    with complete_step("Copying in package manager file trees…"):
+        for tree in context.config.package_manager_trees:
+            install_tree(context.config, tree.source, context.pkgmngr, target=tree.target, preserve=False)
+
+
+def install_package_directories(context: Context) -> None:
+    if not context.config.package_directories:
+        return
+
+    with complete_step("Copying in extra packages…"):
+        for d in context.config.package_directories:
+            for p in itertools.chain(
+                d.glob("*.rpm"),
+                d.glob("*.pkg.tar*"),
+                d.glob("*.deb*"),
+                d.glob("*.ddeb*"),
+                d.glob("*.udeb*"),
+            ):
+                shutil.copy(p, context.packages, follow_symlinks=True)
+
+    if context.want_local_repo():
+        with complete_step("Building local package repository"):
+            context.config.distribution.createrepo(context)
+
+
+def install_extra_trees(context: Context) -> None:
+    if not context.config.extra_trees:
+        return
+
+    with complete_step("Copying in extra file trees…"):
+        for tree in context.config.extra_trees:
+            install_tree(context.config, tree.source, context.root, target=tree.target, preserve=False)
+
+
+def install_build_dest(context: Context) -> None:
+    if not any(context.install_dir.iterdir()):
+        return
+
+    with complete_step("Copying in build tree…"):
+        copy_tree(
+            context.install_dir, context.root,
+            use_subvolumes=context.config.use_subvolumes,
+            sandbox=context.sandbox,
+        )
+
+
+def gzip_binary(context: Context) -> str:
+    return "pigz" if context.config.find_binary("pigz") else "gzip"
+
+
+def fixup_vmlinuz_location(context: Context) -> None:
+    for d in context.root.glob("boot/vmlinuz-*"):
+        kver = d.name.removeprefix("vmlinuz-")
+        vmlinuz = context.root / "usr/lib/modules" / kver / "vmlinuz"
+        # Some distributions (OpenMandriva) symlink /usr/lib/modules/<kver>/vmlinuz to /boot/vmlinuz-<kver>, so get rid
+        # of the symlink and copy the actual vmlinuz to /usr/lib/modules/<kver>.
+        if vmlinuz.is_symlink() and vmlinuz.is_relative_to("/boot"):
+            vmlinuz.unlink()
+        if not vmlinuz.exists():
+            shutil.copy2(d, vmlinuz)
+
+
+def gen_kernel_images(context: Context) -> Iterator[tuple[str, Path]]:
+    if not (context.root / "usr/lib/modules").exists():
+        return
+
+    for kver in sorted(
+        (k for k in (context.root / "usr/lib/modules").iterdir() if k.is_dir()),
+        key=lambda k: GenericVersion(k.name),
+        reverse=True
+    ):
+        # Make sure we look for anything that remotely resembles vmlinuz, as
+        # the arch specific install scripts in the kernel source tree sometimes
+        # do weird stuff. But let's make sure we're not returning UKIs as the
+        # UKI on Fedora is named vmlinuz-virt.efi.
+        for kimg in kver.glob("vmlinuz*"):
+            if KernelType.identify(context.config, kimg) != KernelType.uki:
+                yield kver.name, kimg
+                break
+
+
+def want_initrd(context: Context) -> bool:
+    if context.config.bootable == ConfigFeature.disabled:
+        return False
+
+    if context.config.output_format not in (OutputFormat.disk, OutputFormat.directory):
+        return False
+
+    if not any((context.artifacts / "io.mkosi.initrd").glob("*")) and not any(gen_kernel_images(context)):
+        return False
+
+    return True
+
+
+def finalize_default_initrd(
+    args: Args,
+    config: Config,
+    *,
+    resources: Path,
+    output_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+) -> Config:
+    if config.root_password:
+        password, hashed = config.root_password
+        rootpwopt = f"hashed:{password}" if hashed else password
+    else:
+        rootpwopt = None
+
+    # Default values are assigned via the parser so we go via the argument parser to construct
+    # the config for the initrd.
+    cmdline = [
+        "--directory", "",
+        "--distribution", str(config.distribution),
+        "--release", config.release,
+        "--architecture", str(config.architecture),
+        *(["--mirror", config.mirror] if config.mirror else []),
+        "--repository-key-check", str(config.repository_key_check),
+        "--repositories", ",".join(config.repositories),
+        "--package-manager-tree", ",".join(str(t) for t in config.package_manager_trees),
+        # Note that when compress_output == Compression.none == 0 we don't pass --compress-output which means the
+        # default compression will get picked. This is exactly what we want so that initrds are always compressed.
+        *(["--compress-output", str(config.compress_output)] if config.compress_output else []),
+        "--compress-level", str(config.compress_level),
+        "--with-network", str(config.with_network),
+        "--cache-only", str(config.cacheonly),
+        *(["--output-dir", str(output_dir)] if output_dir else []),
+        *(["--workspace-dir", str(config.workspace_dir)] if config.workspace_dir else []),
+        *(["--cache-dir", str(config.cache_dir)] if config.cache_dir else []),
+        *(["--package-cache-dir", str(config.package_cache_dir)] if config.package_cache_dir else []),
+        *(["--local-mirror", str(config.local_mirror)] if config.local_mirror else []),
+        "--incremental", str(config.incremental),
+        "--acl", str(config.acl),
+        *(f"--package={package}" for package in config.initrd_packages),
+        *(f"--volatile-package={package}" for package in config.initrd_volatile_packages),
+        *(["--package-directory", str(package_dir)] if package_dir else []),
+        "--output", "initrd",
+        *(["--image-id", config.image_id] if config.image_id else []),
+        *(["--image-version", config.image_version] if config.image_version else []),
+        *(
+            ["--source-date-epoch", str(config.source_date_epoch)]
+            if config.source_date_epoch is not None else
+            []
+        ),
+        *(["--locale", config.locale] if config.locale else []),
+        *(["--locale-messages", config.locale_messages] if config.locale_messages else []),
+        *(["--keymap", config.keymap] if config.keymap else []),
+        *(["--timezone", config.timezone] if config.timezone else []),
+        *(["--hostname", config.hostname] if config.hostname else []),
+        *(["--root-password", rootpwopt] if rootpwopt else []),
+        *([f"--environment={k}='{v}'" for k, v in config.environment.items()]),
+        *(["--tools-tree", str(config.tools_tree)] if config.tools_tree else []),
+        *([f"--extra-search-path={p}" for p in config.extra_search_paths]),
+        *(["--proxy-url", config.proxy_url] if config.proxy_url else []),
+        *([f"--proxy-exclude={host}" for host in config.proxy_exclude]),
+        *(["--proxy-peer-certificate", str(p)] if (p := config.proxy_peer_certificate) else []),
+        *(["--proxy-client-certificate", str(p)] if (p := config.proxy_client_certificate) else []),
+        *(["--proxy-client-key", str(p)] if (p := config.proxy_client_key) else []),
+        "--selinux-relabel", str(config.selinux_relabel),
+        *(["-f"] * args.force),
+    ]
+
+    cmdline += ["--include=mkosi-initrd"]
+
+    for include in config.initrd_include:
+        cmdline += ["--include", os.fspath(include)]
+
+    _, [config] = parse_config(cmdline + ["build"], resources=resources)
+
+    run_configure_scripts(config)
+
+    return dataclasses.replace(config, image="default-initrd")
+
+
+def build_default_initrd(context: Context) -> Path:
+    if context.config.distribution == Distribution.custom:
+        die("Building a default initrd is not supported for custom distributions")
+
+    config = finalize_default_initrd(
+        context.args,
+        context.config,
+        resources=context.resources,
+        output_dir=context.workspace,
+        package_dir=context.packages,
     )
 
-    print(table)
+    assert config.output_dir
 
-    run(["sfdisk", "--color=never", loopdev], input=table.encode("utf-8"))
-    run(["sync"])
+    config.output_dir.mkdir(exist_ok=True)
 
-    MkosiPrinter.print_step("Writing partition...")
+    if (config.output_dir / config.output).exists():
+        return config.output_dir / config.output
 
-    if args.root_partno == partno:
-        luks_format_root(args, loopdev, False, True)
-        dev = luks_setup_root(args, loopdev, False, True)
+    with (
+        complete_step("Building default initrd"),
+        setup_workspace(context.args, config) as workspace,
+    ):
+        build_image(
+            Context(
+                context.args,
+                config,
+                workspace=workspace,
+                resources=context.resources,
+                # Re-use the repository metadata snapshot from the main image for the initrd.
+                package_cache_dir=context.package_cache_dir,
+            )
+        )
+
+    return config.output_dir / config.output
+
+
+def identify_cpu(root: Path) -> tuple[Optional[Path], Optional[Path]]:
+    for entry in Path("/proc/cpuinfo").read_text().split("\n\n"):
+        vendor_id = family = model = stepping = None
+        for line in entry.splitlines():
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+
+            if not key or not value:
+                continue
+
+            if key == "vendor_id":
+                vendor_id = value
+            elif key == "cpu family":
+                family = int(value)
+            elif key == "model":
+                model = int(value)
+            elif key == "stepping":
+                stepping = int(value)
+
+        if vendor_id is not None and family is not None and model is not None and stepping is not None:
+            break
     else:
-        dev = None
+        return (None, None)
 
-    path = dev if dev is not None else partition(loopdev, partno)
-    try:
-        run(["dd", f"if={blob.name}", f"of={path}", "conv=nocreat"])
-    finally:
-        luks_close(dev, "Closing LUKS root partition")
+    if vendor_id == "AuthenticAMD":
+        uroot = root / "usr/lib/firmware/amd-ucode"
+        if family > 21:
+            ucode = uroot / f"microcode_amd_fam{family:x}h.bin"
+        else:
+            ucode = uroot / "microcode_amd.bin"
+        if ucode.exists():
+            return (Path(f"{vendor_id}.bin"), ucode)
+    elif vendor_id == "GenuineIntel":
+        uroot = root / "usr/lib/firmware/intel-ucode"
+        if (ucode := (uroot / f"{family:02x}-{model:02x}-{stepping:02x}")).exists():
+            return (Path(f"{vendor_id}.bin"), ucode)
+        if (ucode := (uroot / f"{family:02x}-{model:02x}-{stepping:02x}.initramfs")).exists():
+            return (Path(f"{vendor_id}.bin"), ucode)
 
-    args.ran_sfdisk = True
-
-    return blob_size
+    return (Path(f"{vendor_id}.bin"), None)
 
 
-def insert_generated_root(
-    args: CommandLineArguments,
-    root: str,
-    raw: Optional[BinaryIO],
-    loopdev: Optional[str],
-    image: Optional[BinaryIO],
-    for_cache: bool,
+def build_microcode_initrd(context: Context) -> list[Path]:
+    if not context.config.architecture.is_x86_variant():
+        return []
+
+    microcode = context.workspace / "microcode.initrd"
+    if microcode.exists():
+        return [microcode]
+
+    amd = context.root / "usr/lib/firmware/amd-ucode"
+    intel = context.root / "usr/lib/firmware/intel-ucode"
+
+    if not amd.exists() and not intel.exists():
+        logging.warning("/usr/lib/firmware/{amd-ucode,intel-ucode} not found, not adding microcode")
+        return []
+
+    root = context.workspace / "microcode-root"
+    destdir = root / "kernel/x86/microcode"
+
+    with umask(~0o755):
+        destdir.mkdir(parents=True, exist_ok=True)
+
+    if context.config.microcode_host:
+        vendorfile, ucodefile = identify_cpu(context.root)
+        if vendorfile is None or ucodefile is None:
+            logging.warning("Unable to identify CPU for MicrocodeHostonly=")
+            return []
+        with (destdir / vendorfile).open("wb") as f:
+            f.write(ucodefile.read_bytes())
+    else:
+        if amd.exists():
+            with (destdir / "AuthenticAMD.bin").open("wb") as f:
+                for p in amd.iterdir():
+                    f.write(p.read_bytes())
+
+        if intel.exists():
+            with (destdir / "GenuineIntel.bin").open("wb") as f:
+                for p in intel.iterdir():
+                    f.write(p.read_bytes())
+
+    make_cpio(root, microcode, sandbox=context.sandbox)
+
+    return [microcode]
+
+
+def build_kernel_modules_initrd(context: Context, kver: str) -> Path:
+    kmods = context.workspace / f"kernel-modules-{kver}.initrd"
+    if kmods.exists():
+        return kmods
+
+    make_cpio(
+        context.root, kmods,
+        files=gen_required_kernel_modules(
+            context.root, kver,
+            include=context.config.kernel_modules_initrd_include,
+            exclude=context.config.kernel_modules_initrd_exclude,
+            host=context.config.kernel_modules_initrd_include_host,
+            sandbox=context.sandbox,
+        ),
+        sandbox=context.sandbox,
+    )
+
+
+    if context.config.distribution.is_apt_distribution():
+        # Ubuntu Focal's kernel does not support zstd-compressed initrds so use xz instead.
+        if context.config.distribution == Distribution.ubuntu and context.config.release == "focal":
+            compression = Compression.xz
+        # Older Debian and Ubuntu releases do not compress their kernel modules, so we compress the initramfs instead.
+        # Note that this is not ideal since the compressed kernel modules will all be decompressed on boot which
+        # requires significant memory.
+        elif context.config.distribution == Distribution.debian and context.config.release in ("sid", "testing"):
+            compression = Compression.none
+        else:
+            compression = Compression.zstd
+
+        maybe_compress(context, compression, kmods, kmods)
+
+    return kmods
+
+
+def join_initrds(initrds: Sequence[Path], output: Path) -> Path:
+    assert initrds
+
+    if len(initrds) == 1:
+        shutil.copy2(initrds[0], output)
+        return output
+
+    seq = io.BytesIO()
+    for p in initrds:
+        initrd = p.read_bytes()
+        n = len(initrd)
+        padding = b'\0' * (round_up(n, 4) - n)  # pad to 32 bit alignment
+        seq.write(initrd)
+        seq.write(padding)
+
+    output.write_bytes(seq.getbuffer())
+    return output
+
+
+def python_binary(config: Config) -> str:
+    # If there's no tools tree, prefer the interpreter from MKOSI_INTERPRETER. If there is a tools
+    # tree, just use the default python3 interpreter.
+    return "python3" if config.tools_tree else os.getenv("MKOSI_INTERPRETER", "python3")
+
+
+def extract_pe_section(context: Context, binary: Path, section: str, output: Path) -> Path:
+    # When using a tools tree, we want to use the pefile module from the tools tree instead of requiring that
+    # python-pefile is installed on the host. So we execute python as a subprocess to make sure we load
+    # pefile from the tools tree if one is used.
+
+    # TODO: Use ignore_padding=True instead of length once we can depend on a newer pefile.
+    pefile = textwrap.dedent(
+        f"""\
+        import pefile
+        import sys
+        from pathlib import Path
+        pe = pefile.PE("{binary}", fast_load=True)
+        section = {{s.Name.decode().strip("\\0"): s for s in pe.sections}}["{section}"]
+        sys.stdout.buffer.write(section.get_data(length=section.Misc_VirtualSize))
+        """
+    )
+
+    with open(output, "wb") as f:
+        run(
+            [python_binary(context.config)],
+            input=pefile,
+            stdout=f,
+            sandbox=context.sandbox(binary=python_binary(context.config), mounts=[Mount(binary, binary, ro=True)])
+        )
+
+    return output
+
+
+def want_signed_pcrs(config: Config) -> bool:
+    return (
+        config.sign_expected_pcr == ConfigFeature.enabled or
+        (
+            config.sign_expected_pcr == ConfigFeature.auto and
+            config.find_binary("systemd-measure", "/usr/lib/systemd/systemd-measure") is not None
+        )
+    )
+
+
+def build_uki(
+    context: Context,
+    stub: Path,
+    kver: str,
+    kimg: Path,
+    microcodes: list[Path],
+    initrds: list[Path],
+    cmdline: Sequence[str],
+    output: Path,
 ) -> None:
-    if not args.generated_root():
-        return
-    if not args.output_format.is_disk():
-        return
-    if for_cache:
-        return
-    assert raw is not None
-    assert loopdev is not None
-    assert image is not None
+    # Older versions of systemd-stub expect the cmdline section to be null terminated. We can't embed
+    # nul terminators in argv so let's communicate the cmdline via a file instead.
+    (context.workspace / "cmdline").write_text(f"{' '.join(cmdline).strip()}\x00")
 
-    with complete_step("Inserting generated root partition"):
-        args.root_size = insert_partition(
-            args,
-            root,
-            raw,
-            loopdev,
-            args.root_partno,
-            image,
-            "Root Partition",
-            gpt_root_native(args.architecture).root,
-            args.output_format.is_squashfs(),
+    if not (arch := context.config.architecture.to_efi()):
+        die(f"Architecture {context.config.architecture} does not support UEFI")
+
+    if not (ukify := context.config.find_binary("ukify", "/usr/lib/systemd/ukify")):
+        die("Could not find ukify")
+
+    cmd: list[PathString] = [
+        ukify,
+        "--cmdline", f"@{context.workspace / 'cmdline'}",
+        "--os-release", f"@{context.root / 'usr/lib/os-release'}",
+        "--stub", stub,
+        "--output", output,
+        "--efi-arch", arch,
+        "--uname", kver,
+    ]
+
+    mounts = [
+        Mount(output.parent, output.parent),
+        Mount(context.workspace / "cmdline", context.workspace / "cmdline", ro=True),
+        Mount(context.root / "usr/lib/os-release", context.root / "usr/lib/os-release", ro=True),
+        Mount(stub, stub, ro=True),
+    ]
+
+    if context.config.secure_boot:
+        assert context.config.secure_boot_key
+        assert context.config.secure_boot_certificate
+
+        cmd += ["--sign-kernel"]
+
+        if context.config.secure_boot_sign_tool != SecureBootSignTool.pesign:
+            cmd += [
+                "--signtool", "sbsign",
+                "--secureboot-private-key",
+                context.config.secure_boot_key,
+                "--secureboot-certificate",
+                context.config.secure_boot_certificate,
+            ]
+            mounts += [
+                Mount(context.config.secure_boot_certificate, context.config.secure_boot_certificate, ro=True),
+            ]
+            if context.config.secure_boot_key_source.type == KeySource.Type.engine:
+                cmd += ["--signing-engine", context.config.secure_boot_key_source.source]
+            if context.config.secure_boot_key.exists():
+                mounts += [Mount(context.config.secure_boot_key, context.config.secure_boot_key, ro=True)]
+        else:
+            pesign_prepare(context)
+            cmd += [
+                "--signtool", "pesign",
+                "--secureboot-certificate-dir",
+                context.workspace / "pesign",
+                "--secureboot-certificate-name",
+                certificate_common_name(context, context.config.secure_boot_certificate),
+            ]
+            mounts += [Mount(context.workspace / "pesign", context.workspace / "pesign", ro=True)]
+
+        if want_signed_pcrs(context.config):
+            cmd += [
+                "--pcr-private-key", context.config.secure_boot_key,
+                # SHA1 might be disabled in OpenSSL depending on the distro so we opt to not sign for SHA1 to avoid
+                # having to manage a bunch of configuration to re-enable SHA1.
+                "--pcr-banks", "sha256",
+            ]
+            if context.config.secure_boot_key.exists():
+                mounts += [Mount(context.config.secure_boot_key, context.config.secure_boot_key)]
+            if context.config.secure_boot_key_source.type == KeySource.Type.engine:
+                cmd += [
+                    "--signing-engine", context.config.secure_boot_key_source.source,
+                    "--pcr-public-key", context.config.secure_boot_certificate,
+                ]
+                mounts += [
+                    Mount(context.config.secure_boot_certificate, context.config.secure_boot_certificate, ro=True),
+                ]
+
+    cmd += ["build", "--linux", kimg]
+    mounts += [Mount(kimg, kimg, ro=True)]
+
+    if microcodes:
+        # new .ucode section support?
+        if (
+            systemd_tool_version(context.config, ukify) >= "256~devel" and
+            systemd_stub_version(context, stub) >= "256~devel"
+        ):
+            for microcode in microcodes:
+                cmd += ["--microcode", microcode]
+                mounts += [Mount(microcode, microcode, ro=True)]
+        else:
+            initrds = microcodes + initrds
+
+    for initrd in initrds:
+        cmd += ["--initrd", initrd]
+        mounts += [Mount(initrd, initrd, ro=True)]
+
+    with complete_step(f"Generating unified kernel image for kernel version {kver}"):
+        run(
+            cmd,
+            sandbox=context.sandbox(
+                binary=ukify,
+                mounts=mounts,
+                devices=context.config.secure_boot_key_source.type != KeySource.Type.file,
+            ),
         )
 
 
-def make_verity(
-    args: CommandLineArguments, root: str, dev: Optional[str], do_run_build_script: bool, for_cache: bool
-) -> Tuple[Optional[BinaryIO], Optional[str]]:
-    if do_run_build_script or not args.verity:
-        return None, None
-    if for_cache:
-        return None, None
-    assert dev is not None
+def want_efi(config: Config) -> bool:
+    # Do we want to make the image bootable on EFI firmware?
+    # Note that this returns True also in the case where autodetection might later
+    # cause the system to not be made bootable on EFI firmware after the filesystem
+    # has been populated.
 
-    with complete_step("Generating verity hashes"):
-        f: BinaryIO = cast(BinaryIO, tempfile.NamedTemporaryFile(dir=os.path.dirname(args.output), prefix=".mkosi-"))
-        c = run(["veritysetup", "format", dev, f.name], stdout=PIPE)
+    if config.output_format in (OutputFormat.uki, OutputFormat.esp):
+        return True
 
-        for line in c.stdout.decode("utf-8").split("\n"):
-            if line.startswith("Root hash:"):
-                root_hash = line[10:].strip()
-                return f, root_hash
+    if config.bootable == ConfigFeature.disabled:
+        return False
 
-        raise ValueError("Root hash not found")
+    if config.bootloader == Bootloader.none:
+        return False
+
+    if (
+        (config.output_format == OutputFormat.cpio or config.output_format.is_extension_image() or config.overlay)
+        and config.bootable == ConfigFeature.auto
+    ):
+        return False
+
+    if config.architecture.to_efi() is None:
+        if config.bootable == ConfigFeature.enabled:
+            die(f"Cannot make image bootable on UEFI on {config.architecture} architecture")
+
+        return False
+
+    return True
 
 
-def insert_verity(
-    args: CommandLineArguments,
-    root: str,
-    raw: Optional[BinaryIO],
-    loopdev: Optional[str],
-    verity: Optional[BinaryIO],
-    root_hash: Optional[str],
-    for_cache: bool,
+def systemd_stub_binary(context: Context) -> Path:
+    arch = context.config.architecture.to_efi()
+    stub = context.root / f"usr/lib/systemd/boot/efi/linux{arch}.efi.stub"
+    return stub
+
+
+def systemd_stub_version(context: Context, stub: Path) -> GenericVersion:
+    sdmagic = extract_pe_section(context, stub, ".sdmagic", context.workspace / "sdmagic")
+    sdmagic_text = sdmagic.read_text()
+    if version := re.match(r"#### LoaderInfo: systemd-stub (?P<version>[.~^a-zA-Z0-9-+]+) ####", sdmagic_text):
+        return GenericVersion(version.group("version"))
+    die(f"Unable to determine systemd-stub version, found {sdmagic_text!r}")
+
+
+def want_uki(context: Context) -> bool:
+    return want_efi(context.config) and (
+            context.config.bootloader == Bootloader.uki or
+            context.config.unified_kernel_images == ConfigFeature.enabled or (
+                context.config.unified_kernel_images == ConfigFeature.auto and
+                systemd_stub_binary(context).exists() and
+                context.config.find_binary("ukify", "/usr/lib/systemd/ukify") is not None
+            )
+    )
+
+
+def find_entry_token(context: Context) -> str:
+    if (
+        "--version" not in run(["kernel-install", "--help"],
+                               stdout=subprocess.PIPE, sandbox=context.sandbox(binary="kernel-install")).stdout or
+        systemd_tool_version(context.config, "kernel-install") < "255.1"
+    ):
+        return context.config.image_id or context.config.distribution.name
+
+    output = json.loads(
+        run(
+            ["kernel-install", "--root=/buildroot", "--json=pretty", "inspect"],
+            sandbox=context.sandbox(binary="kernel-install", mounts=[Mount(context.root, "/buildroot", ro=True)]),
+            stdout=subprocess.PIPE,
+            env={"SYSTEMD_ESP_PATH": "/efi", "SYSTEMD_XBOOTLDR_PATH": "/boot"},
+        ).stdout
+    )
+
+    logging.debug(json.dumps(output, indent=4))
+    return cast(str, output["EntryToken"])
+
+
+def finalize_cmdline(context: Context, roothash: Optional[str]) -> list[str]:
+    if (context.root / "etc/kernel/cmdline").exists():
+        cmdline = [(context.root / "etc/kernel/cmdline").read_text().strip()]
+    elif (context.root / "usr/lib/kernel/cmdline").exists():
+        cmdline = [(context.root / "usr/lib/kernel/cmdline").read_text().strip()]
+    else:
+        cmdline = []
+
+    if roothash:
+        cmdline += [roothash]
+
+    return cmdline + context.config.kernel_command_line
+
+
+def finalize_microcode(context: Context) -> list[Path]:
+    if any((context.artifacts / "io.mkosi.microcode").glob("*")):
+        return sorted((context.artifacts / "io.mkosi.microcode").iterdir())
+    elif microcode := build_microcode_initrd(context):
+        return microcode
+    return []
+
+
+def finalize_initrds(context: Context) -> list[Path]:
+    if context.config.initrds:
+        return context.config.initrds
+    elif any((context.artifacts / "io.mkosi.initrd").glob("*")):
+        return sorted((context.artifacts / "io.mkosi.initrd").iterdir())
+    return [build_default_initrd(context)]
+
+
+def install_type1(
+    context: Context,
+    kver: str,
+    kimg: Path,
+    token: str,
+    partitions: Sequence[Partition],
 ) -> None:
-    if verity is None:
-        return
-    if for_cache:
-        return
-    assert loopdev is not None
-    assert raw is not None
-    assert root_hash is not None
+    dst = context.root / "boot" / token / kver
+    entry = context.root / f"boot/loader/entries/{token}-{kver}.conf"
+    with umask(~0o700):
+        dst.mkdir(parents=True, exist_ok=True)
+        entry.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use the final 128 bit of the root hash as partition UUID of the verity partition
-    u = uuid.UUID(root_hash[-32:])
+    kmods = build_kernel_modules_initrd(context, kver)
+    cmdline = finalize_cmdline(context, finalize_roothash(partitions))
 
-    with complete_step("Inserting verity partition"):
-        insert_partition(
-            args,
-            root,
-            raw,
-            loopdev,
-            args.verity_partno,
-            verity,
-            "Verity Partition",
-            gpt_root_native(args.architecture).verity,
-            True,
-            u,
+    with umask(~0o600):
+        if (
+            want_efi(context.config) and
+            context.config.secure_boot and
+            context.config.shim_bootloader != ShimBootloader.signed and
+            KernelType.identify(context.config, kimg) == KernelType.pe
+        ):
+            kimg = sign_efi_binary(context, kimg, dst / "vmlinuz")
+        else:
+            kimg = Path(shutil.copy2(context.root / kimg, dst / "vmlinuz"))
+
+        initrds = [
+            Path(shutil.copy2(initrd, dst.parent / initrd.name))
+            for initrd in finalize_microcode(context) + finalize_initrds(context)
+        ]
+        initrds += [Path(shutil.copy2(kmods, dst / "kernel-modules.initrd"))]
+
+        with entry.open("w") as f:
+            f.write(
+                textwrap.dedent(
+                    f"""\
+                    title {token} {kver}
+                    version {kver}
+                    linux /{kimg.relative_to(context.root / "boot")}
+                    options {" ".join(cmdline)}
+                    """
+                )
+            )
+
+            for initrd in initrds:
+                f.write(f'initrd /{initrd.relative_to(context.root / "boot")}\n')
+
+    if want_grub_efi(context) or want_grub_bios(context, partitions):
+        config = prepare_grub_config(context)
+        assert config
+
+        root = finalize_root(partitions)
+        assert root
+
+        with config.open("a") as f:
+            f.write("if ")
+
+            conditions = []
+            if want_grub_efi(context) and not want_uki(context):
+                conditions += ['[ "${grub_platform}" = efi ]']
+            if want_grub_bios(context, partitions):
+                conditions += ['[ "${grub_platform}" = pc ]']
+
+            f.write(" || ".join(conditions))
+            f.write("; then\n")
+
+            f.write(
+                textwrap.dedent(
+                    f"""\
+                    menuentry "{token}-{kver}" {{
+                        linux /{kimg.relative_to(context.root / "boot")} {root} {" ".join(cmdline)}
+                        initrd {" ".join(os.fspath(Path("/") / i.relative_to(context.root / "boot")) for i in initrds)}
+                    }}
+                    """
+                )
+            )
+
+            f.write("fi\n")
+
+
+def install_uki(context: Context, kver: str, kimg: Path, token: str, partitions: Sequence[Partition]) -> None:
+    roothash = finalize_roothash(partitions)
+
+    boot_count = ""
+    if (context.root / "etc/kernel/tries").exists():
+        boot_count = f'+{(context.root / "etc/kernel/tries").read_text().strip()}'
+
+    if context.config.bootloader == Bootloader.uki:
+        if context.config.shim_bootloader != ShimBootloader.none:
+            boot_binary = context.root / shim_second_stage_binary(context)
+        else:
+            boot_binary = context.root / efi_boot_binary(context)
+    else:
+        if roothash:
+            _, _, h = roothash.partition("=")
+            boot_binary = context.root / f"boot/EFI/Linux/{token}-{kver}-{h}{boot_count}.efi"
+        else:
+            boot_binary = context.root / f"boot/EFI/Linux/{token}-{kver}{boot_count}.efi"
+
+    # Make sure the parent directory where we'll be writing the UKI exists.
+    with umask(~0o700):
+        boot_binary.parent.mkdir(parents=True, exist_ok=True)
+
+    if context.config.shim_bootloader == ShimBootloader.signed:
+        for p in (context.root / "usr/lib/modules" / kver).glob("*.efi"):
+            log_step(f"Installing prebuilt UKI at {p} to {boot_binary}")
+            shutil.copy2(p, boot_binary)
+            break
+        else:
+            if context.config.bootable == ConfigFeature.enabled:
+                die(f"Couldn't find a signed UKI binary installed at /usr/lib/modules/{kver} in the image")
+
+            return
+    else:
+        microcodes = finalize_microcode(context)
+
+        initrds = finalize_initrds(context)
+        if context.config.kernel_modules_initrd:
+            initrds += [build_kernel_modules_initrd(context, kver)]
+
+        build_uki(
+            context,
+            systemd_stub_binary(context),
+            kver,
+            context.root / kimg,
+            microcodes,
+            initrds,
+            finalize_cmdline(context, roothash),
+            boot_binary,
         )
 
+        print_output_size(boot_binary)
 
-def patch_root_uuid(
-    args: CommandLineArguments, loopdev: Optional[str], root_hash: Optional[str], for_cache: bool
-) -> None:
-    if root_hash is None:
-        return
-    assert loopdev is not None
+    if want_grub_efi(context):
+        config = prepare_grub_config(context)
+        assert config
 
-    if for_cache:
-        return
+        with config.open("a") as f:
+            f.write('if [ "${grub_platform}" = efi ]; then\n')
 
-    # Use the first 128bit of the root hash as partition UUID of the root partition
-    u = uuid.UUID(root_hash[:32])
+            f.write(
+                textwrap.dedent(
+                    f"""\
+                    menuentry "{boot_binary.stem}" {{
+                        chainloader /{boot_binary.relative_to(context.root / "boot")}
+                    }}
+                    """
+                )
+            )
 
-    with complete_step("Patching root partition UUID"):
-        run(["sfdisk", "--part-uuid", loopdev, str(args.root_partno), str(u)], check=True)
+            f.write("fi\n")
 
 
-def install_unified_kernel(
-    args: CommandLineArguments,
-    root: str,
-    root_hash: Optional[str],
-    do_run_build_script: bool,
-    for_cache: bool,
-    cached: bool,
-    mount: Callable[[], ContextManager[None]],
-) -> None:
+def install_kernel(context: Context, partitions: Sequence[Partition]) -> None:
     # Iterates through all kernel versions included in the image and generates a combined
     # kernel+initrd+cmdline+osrelease EFI file from it and places it in the /EFI/Linux directory of the ESP.
     # sd-boot iterates through them and shows them in the menu. These "unified" single-file images have the
     # benefit that they can be signed like normal EFI binaries, and can encode everything necessary to boot a
     # specific root device, including the root hash.
 
-    if not args.bootable or args.esp_partno is None or not args.with_unified_kernel_images:
-        return
-    if for_cache and args.verity:
-        return
-    if cached and not args.verity:
+    if context.config.output_format in (OutputFormat.uki, OutputFormat.esp):
         return
 
-    # Don't bother running dracut if this is a development build. Strictly speaking it would probably be a
-    # good idea to run it, so that the development environment differs as little as possible from the final
-    # build, but then again the initrd should not be relevant for building, and dracut is simply very slow,
-    # hence let's avoid it invoking it needlessly, given that we never actually invoke the boot loader on the
-    # development image.
-    if do_run_build_script:
+    if context.config.bootable == ConfigFeature.disabled:
         return
 
-    with mount(), complete_step("Generating combined kernel + initrd boot file"):
-        # Apparently openmandriva hasn't yet completed its usrmerge so we use lib here instead of usr/lib.
-        with os.scandir(os.path.join(root, "lib/modules")) as d:
-            for kver in d:
-                if not kver.is_dir():
-                    continue
-
-                prefix = "/boot" if args.xbootldr_partno is not None else "/efi"
-                # While the kernel version can generally be found as a directory under /usr/lib/modules, the
-                # kernel image files can be found either in /usr/lib/modules/<kernel-version>/vmlinuz or in
-                # /boot depending on the distro. By invoking the kernel-install script directly, we can pass
-                # the empty string as the kernel image which causes the script to not pass the --kernel-image
-                # option to dracut so it searches the image for us.
-                cmdline = [
-                    "/etc/kernel/install.d/50-mkosi-dracut-unified-kernel.install",
-                    "add",
-                    kver.name,
-                    f"{prefix}/{args.machine_id}/{kver.name}",
-                    "",
-                ]
-                if root_hash is not None:
-                    cmdline.append(root_hash)
-
-                run_workspace_command(args, root, cmdline)
-
-
-def secure_boot_sign(
-    args: CommandLineArguments,
-    root: str,
-    do_run_build_script: bool,
-    for_cache: bool,
-    cached: bool,
-    mount: Callable[[], ContextManager[None]],
-) -> None:
-    if do_run_build_script:
-        return
-    if not args.bootable:
-        return
-    if not args.secure_boot:
-        return
-    if for_cache and args.verity:
-        return
-    if cached and not args.verity:
-        return
-
-    with mount():
-        for path, _, filenames in os.walk(os.path.join(root, "efi")):
-            for i in filenames:
-                if not i.endswith(".efi") and not i.endswith(".EFI"):
-                    continue
-
-                with complete_step(f"Signing EFI binary {i} in ESP"):
-                    p = os.path.join(path, i)
-
-                    run(
-                        [
-                            "sbsign",
-                            "--key",
-                            args.secure_boot_key,
-                            "--cert",
-                            args.secure_boot_certificate,
-                            "--output",
-                            p + ".signed",
-                            p,
-                        ],
-                        check=True,
-                    )
-
-                    os.rename(p + ".signed", p)
-
-
-def xz_output(args: CommandLineArguments, raw: Optional[BinaryIO]) -> Optional[BinaryIO]:
-    if not args.output_format.is_disk():
-        return raw
-    assert raw is not None
-
-    if not args.xz:
-        return raw
-
-    xz_binary = "pxz" if shutil.which("pxz") else "xz"
-
-    with complete_step("Compressing image file"):
-        f: BinaryIO = cast(BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-", dir=os.path.dirname(args.output)))
-        run([xz_binary, "-c", raw.name], stdout=f)
-
-    return f
-
-
-def qcow2_output(args: CommandLineArguments, raw: Optional[BinaryIO]) -> Optional[BinaryIO]:
-    if not args.output_format.is_disk():
-        return raw
-    assert raw is not None
-
-    if not args.qcow2:
-        return raw
-
-    with complete_step("Converting image file to qcow2"):
-        f: BinaryIO = cast(BinaryIO, tempfile.NamedTemporaryFile(prefix=".mkosi-", dir=os.path.dirname(args.output)))
-        run(["qemu-img", "convert", "-onocow=on", "-fraw", "-Oqcow2", raw.name, f.name])
-
-    return f
-
-
-def write_root_hash_file(args: CommandLineArguments, root_hash: Optional[str]) -> Optional[BinaryIO]:
-    if root_hash is None:
-        return None
-
-    with complete_step("Writing .roothash file"):
-        f: BinaryIO = cast(
-            BinaryIO,
-            tempfile.NamedTemporaryFile(mode="w+b", prefix=".mkosi", dir=os.path.dirname(args.output_root_hash_file)),
-        )
-        f.write((root_hash + "\n").encode())
-
-    return f
-
-
-def copy_nspawn_settings(args: CommandLineArguments) -> Optional[BinaryIO]:
-    if args.nspawn_settings is None:
-        return None
-
-    with complete_step("Copying nspawn settings file"):
-        f: BinaryIO = cast(
-            BinaryIO,
-            tempfile.NamedTemporaryFile(
-                mode="w+b", prefix=".mkosi-", dir=os.path.dirname(args.output_nspawn_settings)
-            ),
-        )
-
-        with open(args.nspawn_settings, "rb") as c:
-            f.write(c.read())
-
-    return f
-
-
-def hash_file(of: TextIO, sf: BinaryIO, fname: str) -> None:
-    bs = 16 * 1024 ** 2
-    h = hashlib.sha256()
-
-    sf.seek(0)
-    buf = sf.read(bs)
-    while len(buf) > 0:
-        h.update(buf)
-        buf = sf.read(bs)
-
-    of.write(h.hexdigest() + " *" + fname + "\n")
-
-
-def calculate_sha256sum(
-    args: CommandLineArguments,
-    raw: Optional[BinaryIO],
-    tar: Optional[BinaryIO],
-    root_hash_file: Optional[BinaryIO],
-    nspawn_settings: Optional[BinaryIO],
-) -> Optional[TextIO]:
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
-        return None
-
-    if not args.checksum:
-        return None
-
-    with complete_step("Calculating SHA256SUMS"):
-        f: TextIO = cast(
-            TextIO,
-            tempfile.NamedTemporaryFile(
-                mode="w+", prefix=".mkosi-", encoding="utf-8", dir=os.path.dirname(args.output_checksum)
-            ),
-        )
-
-        if raw is not None:
-            hash_file(f, raw, os.path.basename(args.output))
-        if tar is not None:
-            hash_file(f, tar, os.path.basename(args.output))
-        if root_hash_file is not None:
-            hash_file(f, root_hash_file, os.path.basename(args.output_root_hash_file))
-        if nspawn_settings is not None:
-            hash_file(f, nspawn_settings, os.path.basename(args.output_nspawn_settings))
-
-    return f
-
-
-def calculate_signature(args: CommandLineArguments, checksum: Optional[IO[Any]]) -> Optional[BinaryIO]:
-    if not args.sign:
-        return None
-
-    if checksum is None:
-        return None
-
-    with complete_step("Signing SHA256SUMS"):
-        f: BinaryIO = cast(
-            BinaryIO,
-            tempfile.NamedTemporaryFile(mode="wb", prefix=".mkosi-", dir=os.path.dirname(args.output_signature)),
-        )
-
-        cmdline = ["gpg", "--detach-sign"]
-
-        if args.key is not None:
-            cmdline += ["--default-key", args.key]
-
-        checksum.seek(0)
-        run(cmdline, stdin=checksum, stdout=f)
-
-    return f
-
-
-def calculate_bmap(args: CommandLineArguments, raw: Optional[BinaryIO]) -> Optional[TextIO]:
-    if not args.bmap:
-        return None
-
-    if not args.output_format.is_disk_rw():
-        return None
-    assert raw is not None
-
-    with complete_step("Creating BMAP file"):
-        f: TextIO = cast(
-            TextIO,
-            tempfile.NamedTemporaryFile(
-                mode="w+", prefix=".mkosi-", encoding="utf-8", dir=os.path.dirname(args.output_bmap)
-            ),
-        )
-
-        cmdline = ["bmaptool", "create", raw.name]
-        run(cmdline, stdout=f)
-
-    return f
-
-
-def save_cache(args: CommandLineArguments, root: str, raw: Optional[str], cache_path: Optional[str]) -> None:
-    if cache_path is None or raw is None:
-        return
-
-    with complete_step("Installing cache copy ", "Successfully installed cache copy " + cache_path):
-
-        if args.output_format.is_disk_rw():
-            os.chmod(raw, 0o666 & ~args.original_umask)
-            shutil.move(raw, cache_path)
-        else:
-            shutil.move(root, cache_path)
-
-
-def _link_output(args: CommandLineArguments, oldpath: str, newpath: str) -> None:
-    os.chmod(oldpath, 0o666 & ~args.original_umask)
-    os.link(oldpath, newpath)
-    if args.no_chown:
-        return
-
-    sudo_uid = os.getenv("SUDO_UID")
-    sudo_gid = os.getenv("SUDO_GID")
-    if not (sudo_uid and sudo_gid):
-        return
-
-    sudo_user = os.getenv("SUDO_USER", default=sudo_uid)
-    with complete_step(
-        f"Changing ownership of output file {newpath} to user {sudo_user} (acquired from sudo)",
-        f"Successfully changed ownership of {newpath}",
+    if context.config.bootable == ConfigFeature.auto and (
+        context.config.output_format == OutputFormat.cpio or
+        context.config.output_format.is_extension_image() or
+        context.config.overlay
     ):
-        os.chown(newpath, int(sudo_uid), int(sudo_gid))
-
-
-def link_output(args: CommandLineArguments, root: str, artifact: Optional[BinaryIO]) -> None:
-    with complete_step("Linking image file", "Successfully linked " + args.output):
-        if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
-            assert artifact is None
-
-            make_read_only(args, root, for_cache=False, b=False)
-            os.rename(root, args.output)
-            make_read_only(args, args.output, for_cache=False, b=True)
-
-        elif args.output_format.is_disk() or args.output_format in (OutputFormat.plain_squashfs, OutputFormat.tar):
-            assert artifact is not None
-            _link_output(args, artifact.name, args.output)
-
-
-def link_output_nspawn_settings(args: CommandLineArguments, path: Optional[str]) -> None:
-    if path is None:
         return
 
-    with complete_step("Linking nspawn settings file", "Successfully linked " + args.output_nspawn_settings):
-        _link_output(args, path, args.output_nspawn_settings)
+    stub = systemd_stub_binary(context)
+    if want_uki(context) and not stub.exists():
+        die(f"Unified kernel image(s) requested but systemd-stub not found at /{stub.relative_to(context.root)}")
+
+    if context.config.bootable == ConfigFeature.enabled and not any(gen_kernel_images(context)):
+        die("A bootable image was requested but no kernel was found")
+
+    token = find_entry_token(context)
+
+    for kver, kimg in gen_kernel_images(context):
+        if want_uki(context):
+            install_uki(context, kver, kimg, token, partitions)
+        if not want_uki(context) or want_grub_bios(context, partitions):
+            install_type1(context, kver, kimg, token, partitions)
+
+        if context.config.bootloader == Bootloader.uki:
+            break
 
 
-def link_output_checksum(args: CommandLineArguments, checksum: Optional[str]) -> None:
-    if checksum is None:
+def make_uki(context: Context, stub: Path, kver: str, kimg: Path, microcode: list[Path], output: Path) -> None:
+    make_cpio(context.root, context.workspace / "initrd", sandbox=context.sandbox)
+    maybe_compress(context, context.config.compress_output, context.workspace / "initrd", context.workspace / "initrd")
+
+    initrds = [context.workspace / "initrd"]
+
+    build_uki(context, stub, kver, kimg, microcode, initrds, context.config.kernel_command_line, output)
+    extract_pe_section(context, output, ".linux", context.staging / context.config.output_split_kernel)
+    extract_pe_section(context, output, ".initrd", context.staging / context.config.output_split_initrd)
+
+
+def compressor_command(context: Context, compression: Compression) -> list[PathString]:
+    """Returns a command suitable for compressing archives."""
+
+    if compression == Compression.gz:
+        return [gzip_binary(context), f"-{context.config.compress_level}", "--stdout", "-"]
+    elif compression == Compression.xz:
+        return ["xz", "--check=crc32", f"-{context.config.compress_level}", "-T0", "--stdout", "-"]
+    elif compression == Compression.zstd:
+        return ["zstd", "-q", f"-{context.config.compress_level}", "-T0", "--stdout", "-"]
+    else:
+        die(f"Unknown compression {compression}")
+
+
+def maybe_compress(context: Context, compression: Compression, src: Path, dst: Optional[Path] = None) -> None:
+    if not compression or src.is_dir():
+        if dst:
+            move_tree(
+                src, dst,
+                use_subvolumes=context.config.use_subvolumes,
+                sandbox=context.sandbox,
+            )
         return
 
-    with complete_step("Linking SHA256SUMS file", "Successfully linked " + args.output_checksum):
-        _link_output(args, checksum, args.output_checksum)
+    if not dst:
+        dst = src.parent / f"{src.name}{compression.extension()}"
+
+    cmd = compressor_command(context, compression)
+
+    with complete_step(f"Compressing {src} with {compression}"):
+        with src.open("rb") as i:
+            src.unlink() # if src == dst, make sure dst doesn't truncate the src file but creates a new file.
+
+            with dst.open("wb") as o:
+                run(cmd, stdin=i, stdout=o, sandbox=context.sandbox(binary=cmd[0]))
 
 
-def link_output_root_hash_file(args: CommandLineArguments, root_hash_file: Optional[str]) -> None:
-    if root_hash_file is None:
+def copy_uki(context: Context) -> None:
+    if (context.staging / context.config.output_split_uki).exists():
         return
 
-    with complete_step("Linking .roothash file", "Successfully linked " + args.output_root_hash_file):
-        _link_output(args, root_hash_file, args.output_root_hash_file)
-
-
-def link_output_signature(args: CommandLineArguments, signature: Optional[str]) -> None:
-    if signature is None:
+    if not want_efi(context.config) or context.config.unified_kernel_images == ConfigFeature.disabled:
         return
 
-    with complete_step("Linking SHA256SUMS.gpg file", "Successfully linked " + args.output_signature):
-        _link_output(args, signature, args.output_signature)
+    ukis = sorted(
+        (context.root / "boot/EFI/Linux").glob("*.efi"),
+        key=lambda p: GenericVersion(p.name),
+        reverse=True,
+    )
 
-
-def link_output_bmap(args: CommandLineArguments, bmap: Optional[str]) -> None:
-    if bmap is None:
+    if (
+        (uki := context.root / efi_boot_binary(context)).exists() and
+        KernelType.identify(context.config, uki) == KernelType.uki
+    ):
+        pass
+    elif (
+        (uki := context.root / shim_second_stage_binary(context)).exists() and
+        KernelType.identify(context.config, uki) == KernelType.uki
+    ):
+        pass
+    elif ukis:
+        uki = ukis[0]
+    else:
         return
 
-    with complete_step("Linking .bmap file", "Successfully linked " + args.output_bmap):
-        _link_output(args, bmap, args.output_bmap)
+    shutil.copy(uki, context.staging / context.config.output_split_uki)
+
+    # Extract the combined initrds from the UKI so we can use it to direct kernel boot with qemu if needed.
+    extract_pe_section(context, uki, ".initrd", context.staging / context.config.output_split_initrd)
+
+    # ukify will have signed the kernel image as well. Let's make sure we put the signed kernel image in the output
+    # directory instead of the unsigned one by reading it from the UKI.
+    extract_pe_section(context, uki, ".linux", context.staging / context.config.output_split_kernel)
 
 
-def link_output_sshkey(args: CommandLineArguments, sshkey: Optional[str]) -> None:
-    if sshkey is None:
+def copy_vmlinuz(context: Context) -> None:
+    if (context.staging / context.config.output_split_kernel).exists():
         return
 
-    with complete_step("Linking private ssh key file", f"Successfully linked {args.output_sshkey}"):
-        _link_output(args, sshkey, args.output_sshkey)
-        os.chmod(args.output_sshkey, 0o600)
+    for _, kimg in gen_kernel_images(context):
+        shutil.copy(context.root / kimg, context.staging / context.config.output_split_kernel)
+        break
 
 
-def dir_size(path: str) -> int:
+def copy_nspawn_settings(context: Context) -> None:
+    if context.config.nspawn_settings is None:
+        return None
+
+    with complete_step("Copying nspawn settings file…"):
+        shutil.copy2(context.config.nspawn_settings, context.staging / context.config.output_nspawn_settings)
+
+
+def copy_initrd(context: Context) -> None:
+    if not want_initrd(context):
+        return
+
+    if (context.staging / context.config.output_split_initrd).exists():
+        return
+
+    for kver, _ in gen_kernel_images(context):
+        initrds = finalize_initrds(context)
+
+        if context.config.kernel_modules_initrd:
+            kver = next(gen_kernel_images(context))[0]
+            initrds += [build_kernel_modules_initrd(context, kver)]
+        join_initrds(initrds, context.staging / context.config.output_split_initrd)
+        break
+
+
+def calculate_sha256sum(context: Context) -> None:
+    if not context.config.checksum:
+        return
+
+    if context.config.output_format == OutputFormat.directory:
+        return
+
+    with complete_step("Calculating SHA256SUMS…"):
+        with open(context.workspace / context.config.output_checksum, "w") as f:
+            for p in context.staging.iterdir():
+                print(hash_file(p) + " *" + p.name, file=f)
+
+        (context.workspace / context.config.output_checksum).rename(context.staging / context.config.output_checksum)
+
+
+def calculate_signature(context: Context) -> None:
+    if not context.config.sign or not context.config.checksum:
+        return
+
+    if context.config.output_format == OutputFormat.directory:
+        return
+
+    cmdline: list[PathString] = ["gpg", "--detach-sign"]
+
+    # Need to specify key before file to sign
+    if context.config.key is not None:
+        cmdline += ["--default-key", context.config.key]
+
+    cmdline += ["--output", "-", "-"]
+
+    home = Path(context.config.environment.get("GNUPGHOME", INVOKING_USER.home() / ".gnupg"))
+    if not home.exists():
+        die(f"GPG home {home} not found")
+
+    env = dict(GNUPGHOME=os.fspath(home))
+    if sys.stderr.isatty():
+        env |= dict(GPGTTY=os.ttyname(sys.stderr.fileno()))
+
+    options: list[PathString] = ["--perms", "755", "--dir", home]
+    mounts = [Mount(home, home)]
+
+    # gpg can communicate with smartcard readers via this socket so bind mount it in if it exists.
+    if (p := Path("/run/pcscd/pcscd.comm")).exists():
+        options += ["--perms", "755", "--dir", p.parent]
+        mounts += [Mount(p, p)]
+
+    with (
+        complete_step("Signing SHA256SUMS…"),
+        open(context.staging / context.config.output_checksum, "rb") as i,
+        open(context.staging / context.config.output_signature, "wb") as o,
+    ):
+        run(
+            cmdline,
+            env=env,
+            stdin=i,
+            stdout=o,
+            # GPG messes with the user's home directory so we run it as the invoking user.
+            sandbox=context.sandbox(
+                binary="gpg",
+                mounts=mounts,
+                options=options,
+                extra=["setpriv", f"--reuid={INVOKING_USER.uid}", f"--regid={INVOKING_USER.gid}", "--clear-groups"],
+            )
+        )
+
+
+def dir_size(path: Union[Path, os.DirEntry[str]]) -> int:
     dir_sum = 0
     for entry in os.scandir(path):
         if entry.is_symlink():
@@ -4049,2527 +2607,2055 @@ def dir_size(path: str) -> int:
         elif entry.is_file():
             dir_sum += entry.stat().st_blocks * 512
         elif entry.is_dir():
-            dir_sum += dir_size(entry.path)
+            dir_sum += dir_size(entry)
     return dir_sum
 
 
-def print_output_size(args: CommandLineArguments) -> None:
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
-        MkosiPrinter.print_step("Resulting image size is " + format_bytes(dir_size(args.output)) + ".")
+def save_manifest(context: Context, manifest: Optional[Manifest]) -> None:
+    if not manifest:
+        return
+
+    if manifest.has_data():
+        if ManifestFormat.json in context.config.manifest_format:
+            with complete_step(f"Saving manifest {context.config.output_manifest}"):
+                with open(context.staging / context.config.output_manifest, 'w') as f:
+                    manifest.write_json(f)
+
+        if ManifestFormat.changelog in context.config.manifest_format:
+            with complete_step(f"Saving report {context.config.output_changelog}"):
+                with open(context.staging / context.config.output_changelog, 'w') as f:
+                    manifest.write_package_report(f)
+
+
+def print_output_size(path: Path) -> None:
+    if path.is_dir():
+        log_step(f"{path} size is " + format_bytes(dir_size(path)) + ".")
     else:
-        st = os.stat(args.output)
-        MkosiPrinter.print_step(
-            "Resulting image size is "
-            + format_bytes(st.st_size)
-            + ", consumes "
-            + format_bytes(st.st_blocks * 512)
-            + "."
-        )  # NOQA: E501
+        size = format_bytes(path.stat().st_size)
+        space = format_bytes(path.stat().st_blocks * 512)
+        log_step(f"{path} size is {size}, consumes {space}.")
 
 
-def setup_package_cache(args: CommandLineArguments) -> Optional[TempDir]:
-    if args.cache_path and os.path.exists(args.cache_path):
-        return None
+def cache_tree_paths(config: Config) -> tuple[Path, Path, Path]:
+    fragments = [config.distribution, config.release, config.architecture]
 
-    d = None
-    with complete_step("Setting up package cache", "Setting up package cache {} complete") as output:
-        if args.cache_path is None:
-            d = tempfile.TemporaryDirectory(dir=os.path.dirname(args.output), prefix=".mkosi-")
-            args.cache_path = d.name
-        else:
-            os.makedirs(args.cache_path, 0o755, exist_ok=True)
-        output.append(args.cache_path)
+    if config.image:
+        fragments += [config.image]
 
-    return d
+    key = '~'.join(str(s) for s in fragments)
 
-
-class ListAction(argparse.Action):
-    delimiter: str
-
-    def __init__(self, *args: Any, choices: Optional[Iterable[Any]] = None, **kwargs: Any) -> None:
-        self.list_choices = choices
-        super().__init__(*args, **kwargs)
-
-    def __call__(
-        self,  # These type-hints are copied from argparse.pyi
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Union[str, Sequence[Any], None],
-        option_string: Optional[str] = None,
-    ) -> None:
-        assert isinstance(values, str)
-        ary = getattr(namespace, self.dest)
-        if ary is None:
-            ary = []
-
-        # Support list syntax for comma separated lists as well
-        if self.delimiter == "," and values.startswith("[") and values.endswith("]"):
-            values = values[1:-1]
-
-        # Make sure delimiters between quotes are ignored by using the csv module.
-        # Inspired by https://stackoverflow.com/a/2787979.
-        new = re.split(f"""{self.delimiter}(?=(?:[^'"]|'[^']*'|"[^"]*")*$)""", values)
-
-        for x in new:
-            x = x.strip()
-            if not x:  # ignore empty entries
-                continue
-            if self.list_choices is not None and x not in self.list_choices:
-                raise ValueError(f"Unknown value {x!r}")
-
-            # Remove ! prefixed list entries from list. !* removes all entries. This works for strings only now.
-            if x.startswith("!*"):
-                ary = []
-            elif x.startswith("!"):
-                if x[1:] in ary:
-                    ary.remove(x[1:])
-            else:
-                ary.append(x)
-        setattr(namespace, self.dest, ary)
+    assert config.cache_dir
+    return (
+        config.cache_dir / f"{key}.cache",
+        config.cache_dir / f"{key}.build.cache",
+        config.cache_dir / f"{key}.manifest",
+    )
 
 
-class CommaDelimitedListAction(ListAction):
-    delimiter = ","
-
-
-class ColonDelimitedListAction(ListAction):
-    delimiter = ":"
-
-
-class SpaceDelimitedListAction(ListAction):
-    delimiter = " "
-
-
-class BooleanAction(argparse.Action):
-    """Parse boolean command line arguments
-
-    The argument may be added more than once. The argument may be set explicitly (--foo yes)
-    or implicitly --foo. If the parameter name starts with "not-" or "without-" the value gets
-    inverted.
+def check_inputs(config: Config) -> None:
     """
-
-    def __init__(
-        self,  # These type-hints are copied from argparse.pyi
-        option_strings: Sequence[str],
-        dest: str,
-        nargs: Optional[Union[int, str]] = None,
-        const: Any = True,
-        default: Any = False,
-        **kwargs: Any,
-    ) -> None:
-        if nargs is not None:
-            raise ValueError("nargs not allowed")
-        super(BooleanAction, self).__init__(option_strings, dest, nargs="?", const=const, default=default, **kwargs)
-
-    def __call__(
-        self,  # These type-hints are copied from argparse.pyi
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Union[str, Sequence[Any], None, bool],
-        option_string: Optional[str] = None,
-    ) -> None:
-        new_value = self.default
-        if isinstance(values, str):
-            try:
-                new_value = parse_boolean(values)
-            except ValueError as exp:
-                raise argparse.ArgumentError(self, str(exp))
-        elif isinstance(values, bool):  # Assign const
-            new_value = values
-        else:
-            raise argparse.ArgumentError(self, "Invalid argument for %s %s" % (str(option_string), str(values)))
-
-        # invert the value if the argument name starts with "not" or "without"
-        for option in self.option_strings:
-            if option[2:].startswith("not-") or option[2:].startswith("without-"):
-                new_value = not new_value
-                break
-
-        setattr(namespace, self.dest, new_value)
-
-
-class WithNetworkAction(BooleanAction):
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Union[str, Sequence[Any], None, bool],
-        option_string: Optional[str] = None,
-    ) -> None:
-
-        if isinstance(values, str):
-            if values == "never":
-                setattr(namespace, self.dest, "never")
-                return
-
-        super().__call__(parser, namespace, values, option_string)
-
-
-class ArgumentParserMkosi(argparse.ArgumentParser):
-    """ArgumentParser with support for mkosi.defaults file(s)
-
-    This derived class adds a simple ini file parser to python's ArgumentParser features.
-    Each line of the ini file is converted to a command line argument. Example:
-    "FooBar=Hello_World"  in the ini file appends "--foo-bar Hello_World" to sys.argv.
-
-    Command line arguments starting with - or --are considered as regular arguments. Arguments
-    starting with @ are considered as files which are fed to the ini file parser implemented
-    in this class.
+    Make sure all the inputs exist that aren't checked during config parsing because they might be created by an
+    earlier build.
     """
-
-    # Mapping of parameters supported in config files but not as command line arguments.
-    SPECIAL_MKOSI_DEFAULT_PARAMS = {
-        "QCow2": "--qcow2",
-        "OutputDirectory": "--output-dir",
-        "XZ": "--xz",
-        "NSpawnSettings": "--settings",
-        "ESPSize": "--esp-size",
-        "CheckSum": "--checksum",
-        "BMap": "--bmap",
-        "Packages": "--package",
-        "ExtraTrees": "--extra-tree",
-        "SkeletonTrees": "--skeleton-tree",
-        "BuildPackages": "--build-package",
-        "PostInstallationScript": "--postinst-script",
-        "GPTFirstLBA": "--gpt-first-lba",
-        "TarStripSELinuxContext": "--tar-strip-selinux-context",
-    }
-
-    fromfile_prefix_chars = "@"
-
-    def __init__(self, *kargs: Any, **kwargs: Any) -> None:
-        self._ini_file_section = ""
-        self._ini_file_key = ""  # multi line list processing
-        self._ini_file_list_mode = False
-
-        # Add config files to be parsed
-        kwargs["fromfile_prefix_chars"] = ArgumentParserMkosi.fromfile_prefix_chars
-        super().__init__(*kargs, **kwargs)
-
-    def _read_args_from_files(self, arg_strings: List[str]) -> List[str]:
-        """Convert @ prefixed command line arguments with corresponding file content
-
-        Regular arguments are just returned. Arguments prefixed with @ are considered as
-        configuration file paths. The settings of each file are parsed and returned as
-        command line arguments.
-        Example:
-          The following mkosi.default is loaded.
-          [Distribution]
-          Distribution=fedora
-
-          mkosi is called like: mkosi -p httpd
-
-          arg_strings: ['@mkosi.default', '-p', 'httpd']
-          return value: ['--distribution', 'fedora', '-p', 'httpd']
-        """
-
-        def camel_to_arg(camel: str) -> str:
-            s1 = re.sub("(.)([A-Z][a-z]+)", r"\1-\2", camel)
-            return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
-
-        def ini_key_to_cli_arg(key: str) -> str:
-            try:
-                return ArgumentParserMkosi.SPECIAL_MKOSI_DEFAULT_PARAMS[key]
-            except KeyError:
-                return "--" + camel_to_arg(key)
-
-        # expand arguments referencing files
-        new_arg_strings = []
-        for arg_string in arg_strings:
-            # for regular arguments, just add them back into the list
-            if not arg_string or arg_string[0] not in self.fromfile_prefix_chars:
-                new_arg_strings.append(arg_string)
-                continue
-            # replace arguments referencing files with the file content
-            try:
-                # This used to use configparser.ConfigParser before, but
-                # ConfigParser's interpolation clashes with systemd style
-                # specifier, e.g. %u for user, since both use % as a sigil.
-                config = configparser.RawConfigParser(delimiters="=")
-                config.optionxform = str  # type: ignore
-                with open(arg_string[1:]) as args_file:
-                    config.read_file(args_file)
-                for section in config.sections():
-                    for key, value in config.items(section):
-                        cli_arg = ini_key_to_cli_arg(key)
-
-                        # \n in value strings is forwarded. Depending on the action type, \n is considered as a delimiter or needs to be replaced by a ' '
-                        for action in self._actions:
-                            if cli_arg in action.option_strings:
-                                if isinstance(action, ListAction):
-                                    value = value.replace(os.linesep, action.delimiter)
-                        new_arg_strings.extend([cli_arg, value])
-            except OSError as e:
-                self.error(str(e))
-        # return the modified argument list
-        return new_arg_strings
-
-
-COMPRESSION_ALGORITHMS = "zlib", "lzo", "zstd", "lz4", "xz"
-
-
-def parse_compression(value: str) -> Union[str, bool]:
-    if value in COMPRESSION_ALGORITHMS:
-        return value
-    return parse_boolean(value)
-
-
-def parse_source_file_transfer(value: str) -> Optional[SourceFileTransfer]:
-    if value == "":
-        return None
-    try:
-        return SourceFileTransfer(value)
-    except Exception as exp:
-        raise argparse.ArgumentTypeError(str(exp))
-
-
-def create_parser() -> ArgumentParserMkosi:
-    parser = ArgumentParserMkosi(prog="mkosi", description="Build Legacy-Free OS Images", add_help=False)
-
-    group = parser.add_argument_group("Commands")
-    group.add_argument("verb", choices=MKOSI_COMMANDS, default="build", help="Operation to execute")
-    group.add_argument(
-        "cmdline", nargs=argparse.REMAINDER, help="The command line to use for " + str(MKOSI_COMMANDS_CMDLINE)[1:-1]
-    )
-    group.add_argument("-h", "--help", action="help", help="Show this help")
-    group.add_argument("--version", action="version", version="%(prog)s " + __version__)
-
-    group = parser.add_argument_group("Distribution")
-    group.add_argument("-d", "--distribution", choices=Distribution.__members__, help="Distribution to install")
-    group.add_argument("-r", "--release", help="Distribution release to install")
-    group.add_argument("-m", "--mirror", help="Distribution mirror to use")
-    group.add_argument(
-        "--repositories",
-        action=CommaDelimitedListAction,
-        dest="repositories",
-        default=[],
-        help="Repositories to use",
-        metavar="REPOS",
-    )
-    group.add_argument("--architecture", help="Override the architecture of installation")
-
-    group = parser.add_argument_group("Output")
-    group.add_argument(
-        "-t",
-        "--format",
-        dest="output_format",
-        choices=OutputFormat,
-        type=OutputFormat.from_string,
-        help="Output Format",
-    )
-    group.add_argument("-o", "--output", help="Output image path", metavar="PATH")
-    group.add_argument("-O", "--output-dir", help="Output root directory", metavar="DIR")
-    group.add_argument(
-        "-f",
-        "--force",
-        action="count",
-        dest="force_count",
-        default=0,
-        help="Remove existing image file before operation",
-    )
-    group.add_argument(
-        "-b",
-        "--bootable",
-        action=BooleanAction,
-        help="Make image bootable on EFI (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)",
-    )
-    group.add_argument(
-        "--boot-protocols",
-        action=CommaDelimitedListAction,
-        help="Boot protocols to use on a bootable image",
-        metavar="PROTOCOLS",
-        default=[],
-    )
-    group.add_argument(
-        "--kernel-command-line",
-        action=SpaceDelimitedListAction,
-        default=["rhgb", "selinux=0", "audit=0"],
-        help="Set the kernel command line (only bootable images)",
-    )
-    group.add_argument(
-        "--kernel-commandline", action=SpaceDelimitedListAction, dest="kernel_command_line", help=argparse.SUPPRESS
-    )  # Compatibility option
-    group.add_argument(
-        "--secure-boot", action=BooleanAction, help="Sign the resulting kernel/initrd image for UEFI SecureBoot"
-    )
-    group.add_argument("--secure-boot-key", help="UEFI SecureBoot private key in PEM format", metavar="PATH")
-    group.add_argument("--secure-boot-certificate", help="UEFI SecureBoot certificate in X509 format", metavar="PATH")
-    group.add_argument(
-        "--secure-boot-valid-days",
-        help="Number of days UEFI SecureBoot keys should be valid when generating keys",
-        metavar="DAYS",
-        default="730",
-    )
-    group.add_argument(
-        "--secure-boot-common-name",
-        help="Template for the UEFI SecureBoot CN when generating keys",
-        metavar="CN",
-        default="mkosi of %u",
-    )
-    group.add_argument(
-        "--read-only",
-        action=BooleanAction,
-        help="Make root volume read-only (only gpt_ext4, gpt_xfs, gpt_btrfs, subvolume, implied with gpt_squashfs and plain_squashfs)",
-    )
-    group.add_argument(
-        "--encrypt", choices=("all", "data"), help='Encrypt everything except: ESP ("all") or ESP and root ("data")'
-    )
-    group.add_argument("--verity", action=BooleanAction, help="Add integrity partition (implies --read-only)")
-    group.add_argument(
-        "--compress",
-        type=parse_compression,
-        help="Enable compression in file system (only gpt_btrfs, subvolume, gpt_squashfs, plain_squashfs)",
-    )
-    group.add_argument(
-        "--mksquashfs", dest="mksquashfs_tool", type=str.split, help="Script to call instead of mksquashfs"
-    )
-    group.add_argument(
-        "--xz",
-        action=BooleanAction,
-        help="Compress resulting image with xz (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs, implied on tar)",
-    )  # NOQA: E501
-    group.add_argument(
-        "--qcow2",
-        action=BooleanAction,
-        help="Convert resulting image to qcow2 (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)",
-    )
-    group.add_argument("--hostname", help="Set hostname")
-    group.add_argument(
-        "--no-chown",
-        action=BooleanAction,
-        help="When running with sudo, disable reassignment of ownership of the generated files to the original user",
-    )  # NOQA: E501
-    group.add_argument(
-        "--tar-strip-selinux-context",
-        action=BooleanAction,
-        help="Do not include SELinux file context information in tar. Not compatible with bsdtar.",
-    )
-    group.add_argument(
-        "-i", "--incremental", action=BooleanAction, help="Make use of and generate intermediary cache images"
-    )
-    group.add_argument("-M", "--minimize", action=BooleanAction, help="Minimize root file system size")
-    group.add_argument(
-        "--without-unified-kernel-images",
-        action=BooleanAction,
-        dest="with_unified_kernel_images",
-        default=True,
-        help="Do not install unified kernel images",
-    )
-    group.add_argument("--with-unified-kernel-images", action=BooleanAction, default=True, help=argparse.SUPPRESS)
-    group.add_argument("--gpt-first-lba", type=int, help="Set the first LBA within GPT Header", metavar="FIRSTLBA")
-    group.add_argument("--hostonly-initrd", action=BooleanAction, help="Enable dracut hostonly option")
-
-    group = parser.add_argument_group("Packages")
-    group.add_argument(
-        "-p",
-        "--package",
-        action=CommaDelimitedListAction,
-        dest="packages",
-        default=[],
-        help="Add an additional package to the OS image",
-        metavar="PACKAGE",
-    )
-    group.add_argument("--with-docs", action=BooleanAction, help="Install documentation")
-    group.add_argument(
-        "-T",
-        "--without-tests",
-        action=BooleanAction,
-        dest="with_tests",
-        default=True,
-        help="Do not run tests as part of build script, if supported",
-    )
-    group.add_argument(
-        "--with-tests", action=BooleanAction, default=True, help=argparse.SUPPRESS
-    )  # Compatibility option
-    group.add_argument("--cache", dest="cache_path", help="Package cache path", metavar="PATH")
-    group.add_argument(
-        "--extra-tree",
-        action=CommaDelimitedListAction,
-        dest="extra_trees",
-        default=[],
-        help="Copy an extra tree on top of image",
-        metavar="PATH",
-    )
-    group.add_argument(
-        "--skeleton-tree",
-        action="append",
-        dest="skeleton_trees",
-        default=[],
-        help="Use a skeleton tree to bootstrap the image before installing anything",
-        metavar="PATH",
-    )
-    group.add_argument("--build-script", help="Build script to run inside image", metavar="PATH")
-    group.add_argument(
-        "--build-environment",
-        action=SpaceDelimitedListAction,
-        dest="build_env",
-        default=[],
-        help="Set an environment variable when running the build script",
-        metavar="NAME=VALUE",
-    )
-    group.add_argument("--build-sources", help="Path for sources to build", metavar="PATH")
-    group.add_argument("--build-dir", help=argparse.SUPPRESS, metavar="PATH")  # Compatibility option
-    group.add_argument(
-        "--build-directory", dest="build_dir", help="Path to use as persistent build directory", metavar="PATH"
-    )
-    group.add_argument(
-        "--include-directory", dest="include_dir", help="Path to use as persistent include directory", metavar="PATH"
-    )
-    group.add_argument(
-        "--install-directory", dest="install_dir", help="Path to use as persistent install directory", metavar="PATH"
-    )
-    group.add_argument(
-        "--build-package",
-        action=CommaDelimitedListAction,
-        dest="build_packages",
-        default=[],
-        help="Additional packages needed for build script",
-        metavar="PACKAGE",
-    )
-    group.add_argument(
-        "--skip-final-phase", action=BooleanAction, help="Skip the (second) final image building phase.", default=False
-    )
-    group.add_argument("--postinst-script", help="Postinstall script to run inside image", metavar="PATH")
-    group.add_argument(
-        "--prepare-script", help="Prepare script to run inside the image before it is cached", metavar="PATH"
-    )
-    group.add_argument("--finalize-script", help="Postinstall script to run outside image", metavar="PATH")
-    group.add_argument(
-        "--source-file-transfer",
-        type=parse_source_file_transfer,
-        choices=[*list(SourceFileTransfer), None],
-        default=None,
-        help="Method used to copy build sources to the build image."
-        + "; ".join([f"'{k}': {v}" for k, v in SourceFileTransfer.doc().items()])
-        + " (default: copy-git-others if in a git repository, otherwise copy-all)",
-    )
-    group.add_argument(
-        "--source-file-transfer-final",
-        type=parse_source_file_transfer,
-        choices=[*list(SourceFileTransfer), None],
-        default=None,
-        help="Method used to copy build sources to the final image."
-        + "; ".join([f"'{k}': {v}" for k, v in SourceFileTransfer.doc().items() if k != SourceFileTransfer.mount])
-        + " (default: None)",
-    )
-    group.add_argument(
-        "--with-network",
-        action=WithNetworkAction,
-        help="Run build and postinst scripts with network access (instead of private network)",
-    )
-    group.add_argument("--settings", dest="nspawn_settings", help="Add in .nspawn settings file", metavar="PATH")
-
-    group = parser.add_argument_group("Partitions")
-    group.add_argument(
-        "--root-size", help="Set size of root partition (only gpt_ext4, gpt_xfs, gpt_btrfs)", metavar="BYTES"
-    )
-    group.add_argument(
-        "--esp-size",
-        help="Set size of EFI system partition (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)",
-        metavar="BYTES",
-    )  # NOQA: E501
-    group.add_argument(
-        "--xbootldr-size",
-        help="Set size of the XBOOTLDR partition (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)",
-        metavar="BYTES",
-    )  # NOQA: E501
-    group.add_argument(
-        "--swap-size",
-        help="Set size of swap partition (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)",
-        metavar="BYTES",
-    )  # NOQA: E501
-    group.add_argument(
-        "--home-size", help="Set size of /home partition (only gpt_ext4, gpt_xfs, gpt_squashfs)", metavar="BYTES"
-    )
-    group.add_argument(
-        "--srv-size", help="Set size of /srv partition (only gpt_ext4, gpt_xfs, gpt_squashfs)", metavar="BYTES"
-    )
-    group.add_argument(
-        "--var-size", help="Set size of /var partition (only gpt_ext4, gpt_xfs, gpt_squashfs)", metavar="BYTES"
-    )
-    group.add_argument(
-        "--tmp-size", help="Set size of /var/tmp partition (only gpt_ext4, gpt_xfs, gpt_squashfs)", metavar="BYTES"
-    )
-
-    group = parser.add_argument_group("Validation (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs, tar)")
-    group.add_argument("--checksum", action=BooleanAction, help="Write SHA256SUMS file")
-    group.add_argument("--sign", action=BooleanAction, help="Write and sign SHA256SUMS file")
-    group.add_argument("--key", help="GPG key to use for signing")
-    group.add_argument(
-        "--bmap",
-        action=BooleanAction,
-        help="Write block map file (.bmap) for bmaptool usage (only gpt_ext4, gpt_btrfs)",
-    )
-    group.add_argument("--password", help="Set the root password")
-    group.add_argument(
-        "--password-is-hashed", action=BooleanAction, help="Indicate that the root password has already been hashed"
-    )
-    group.add_argument("--autologin", action=BooleanAction, help="Enable root autologin")
-
-    group = parser.add_argument_group("Host configuration")
-    group.add_argument(
-        "--extra-search-path",
-        dest="extra_search_paths",
-        action=ColonDelimitedListAction,
-        default=[],
-        help="List of colon-separated paths to look for programs before looking in PATH",
-    )
-    group.add_argument(
-        "--extra-search-paths", dest="extra_search_paths", action=ColonDelimitedListAction, help=argparse.SUPPRESS
-    )  # Compatibility option
-    group.add_argument("--qemu-headless", action=BooleanAction, help="Configure image for qemu's -nographic mode")
-    group.add_argument(
-        "--network-veth",
-        action=BooleanAction,
-        help="Create a virtual Ethernet link between the host and the container/VM",
-    )
-    group.add_argument(
-        "--ephemeral",
-        action=BooleanAction,
-        help="If specified, the container/VM is run with a temporary snapshot of the output image that is "
-        "removed immediately when the container/VM terminates",
-    )
-    group.add_argument(
-        "--ssh", action=BooleanAction, help="Set up SSH access from the host to the final image via `mkosi ssh`"
-    )
-
-    group = parser.add_argument_group("Additional Configuration")
-    group.add_argument("-C", "--directory", help="Change to specified directory before doing anything", metavar="PATH")
-    group.add_argument("--default", dest="default_path", help="Read configuration data from file", metavar="PATH")
-    group.add_argument(
-        "-a", "--all", action="store_true", dest="all", default=False, help="Build all settings files in mkosi.files/"
-    )
-    group.add_argument(
-        "--all-directory",
-        dest="all_directory",
-        help="Specify path to directory to read settings files from",
-        metavar="PATH",
-    )
-
-    group.add_argument(
-        "--debug",
-        action=CommaDelimitedListAction,
-        default=[],
-        help="Turn on debugging output",
-        metavar="SELECTOR",
-        choices=("run", "build-script", "workspace-command"),
-    )
-    try:
-        import argcomplete
-
-        argcomplete.autocomplete(parser)
-    except ImportError:
-        pass
-
-    return parser
-
-
-def load_distribution(args: CommandLineArguments) -> CommandLineArguments:
-    if args.distribution is not None:
-        args.distribution = Distribution[args.distribution]
-
-    if args.distribution is None or args.release is None:
-        d, r = detect_distribution()
-
-        if args.distribution is None:
-            args.distribution = d
-
-        if args.distribution == d and d != Distribution.clear and args.release is None:
-            args.release = r
-
-    if args.distribution is None:
-        die("Couldn't detect distribution.")
-
-    return args
-
-
-def parse_args(argv: Optional[List[str]] = None) -> Dict[str, CommandLineArguments]:
-    """Load default values from files and parse command line arguments
-
-    Do all about default files and command line arguments parsing. If --all argument is passed
-    more than one job needs to be processed. The returned tuple contains CommandLineArguments
-    valid for all jobs as well as a dict containing the arguments per job.
-    """
-    parser = create_parser()
-
-    # always work on a copy, argv will be altered which might has some side effects e.g. in unit tests.
-    if argv is None:
-        argv = copy.deepcopy(sys.argv[1:])
-    else:
-        argv = copy.deepcopy(argv)
-
-    # If ArgumentParserMkosi loads settings from mkosi.default files, the settings from files
-    # are converted to command line arguments. This breaks ArgumentParser's support for default
-    # values of positional arguments. Make sure the verb command gets explicitly passed.
-    # Insert a -- before the positional verb argument otherwise it might be considered as an argument of
-    # a parameter with nargs='?'. For example mkosi -i summary would be treated as -i=summary.
-    found_verb = False
-    for verb in MKOSI_COMMANDS:
-        try:
-            v_i = argv.index(verb)
-            if v_i > 0:
-                if argv[v_i - 1] != "--":
-                    argv.insert(v_i, "--")
-            found_verb = True
-            break
-        except ValueError:
-            pass
-    if found_verb is False:
-        argv.extend(["--", "build"])
-
-    # First run of command line arguments parsing to get the directory of mkosi.default file and the verb argument.
-    args_pre_parsed, _ = parser.parse_known_args(copy.deepcopy(argv))
-
-    if args_pre_parsed.verb == "help":
-        parser.print_help()
-        sys.exit(0)
-
-    # Make sure all paths are absolute and valid.
-    # Relative paths are not valid yet since we are not in the final working directory yet.
-    if args_pre_parsed.directory is not None:
-        args_pre_parsed.directory = os.path.abspath(args_pre_parsed.directory)
-        directory = args_pre_parsed.directory
-    else:
-        directory = os.path.abspath(".")
-
-    if args_pre_parsed.all_directory:
-        if os.path.isabs(args_pre_parsed.all_directory):
-            all_directory = args_pre_parsed.all_directory
-        else:
-            all_directory = os.path.join(directory, args_pre_parsed.all_directory)
-    else:
-        all_directory = os.path.join(directory, "mkosi.files/")
-
-    if args_pre_parsed.default_path:
-        if os.path.isabs(args_pre_parsed.default_path):
-            default_path = args_pre_parsed.default_path
-        else:
-            default_path = os.path.join(directory, args_pre_parsed.default_path)
-
-        if not os.path.exists(default_path):
-            die(f"No config file found at {default_path}")
-    else:
-        default_path = os.path.join(directory, "mkosi.default")
-
-    if args_pre_parsed.all and args_pre_parsed.default_path:
-        die("--all and --default= may not be combined.")
-
-    # Parse everything in --all mode
-    args_all = {}
-    if args_pre_parsed.all:
-        if not os.path.isdir(all_directory):
-            die("all-directory %s does not exist." % all_directory)
-        for f in os.scandir(all_directory):
-            if not f.name.startswith("mkosi."):
-                continue
-            args = parse_args_file(copy.deepcopy(argv), f.path)
-            args_all[f.name] = args
-    # Parse everything in normal mode
-    else:
-        args = parse_args_file_group(argv, default_path)
-
-        args = load_distribution(args)
-
-        # Parse again with any extra distribution files included.
-        args = parse_args_distribution_group(argv, str(args.distribution))
-
-        args_all["default"] = args
-
-    return args_all
-
-
-def parse_args_file(argv_post_parsed: List[str], default_path: str) -> CommandLineArguments:
-    """Parse just one mkosi.* file (--all mode)"""
-    argv_post_parsed.insert(1, ArgumentParserMkosi.fromfile_prefix_chars + default_path)
-    parser = create_parser()
-    # parse all parameters handled by mkosi. Parameters forwarded to subprocesses such as nspawn or qemu end up in cmdline_argv.
-    return parser.parse_args(argv_post_parsed, CommandLineArguments())
-
-
-def parse_args_file_group(argv_post_parsed: List[str], default_path: str) -> CommandLineArguments:
-    """Parse a set of mkosi.default and mkosi.default.d/* files."""
-    # Add the @ prefixed filenames to current argument list in inverse priority order.
-    all_defaults_files = []
-    defaults_dir = "mkosi.default.d"
-    if os.path.isdir(defaults_dir):
-        for defaults_file in sorted(os.listdir(defaults_dir)):
-            defaults_path = os.path.join(defaults_dir, defaults_file)
-            if os.path.isfile(defaults_path):
-                all_defaults_files.append(ArgumentParserMkosi.fromfile_prefix_chars + defaults_path)
-    if os.path.isfile(default_path):
-        all_defaults_files.insert(0, ArgumentParserMkosi.fromfile_prefix_chars + default_path)
-    argv_post_parsed[0:0] = all_defaults_files
-
-    parser = create_parser()
-
-    # parse all parameters handled by mkosi. Parameters forwarded to subprocesses such as nspawn or qemu end up in cmdline_argv.
-    return parser.parse_args(argv_post_parsed, CommandLineArguments())
-
-
-def parse_args_distribution_group(argv_post_parsed: List[str], distribution: str) -> CommandLineArguments:
-    all_defaults_files = []
-    distribution_dir = f"mkosi.default.d/{distribution}"
-    if os.path.isdir(distribution_dir):
-        for distribution_file in sorted(os.listdir(distribution_dir)):
-            distribution_path = os.path.join(distribution_dir, distribution_file)
-            if os.path.isfile(distribution_path):
-                all_defaults_files.append(ArgumentParserMkosi.fromfile_prefix_chars + distribution_path)
-
-    # Insert the distro specific config files after the rest of the config files so they override these.
-    for i, v in enumerate(argv_post_parsed):
-        if not v.startswith(ArgumentParserMkosi.fromfile_prefix_chars):
-            argv_post_parsed[i:i] = all_defaults_files
-            break
-    else:
-        # Append to the end if the args only contain files and no regular args.
-        argv_post_parsed += all_defaults_files
-
-    return create_parser().parse_args(argv_post_parsed, CommandLineArguments())
-
-
-def parse_bytes(num_bytes: Optional[str]) -> Optional[int]:
-    if num_bytes is None:
-        return num_bytes
-
-    if num_bytes.endswith("G"):
-        factor = 1024 ** 3
-    elif num_bytes.endswith("M"):
-        factor = 1024 ** 2
-    elif num_bytes.endswith("K"):
-        factor = 1024
-    else:
-        factor = 1
-
-    if factor > 1:
-        num_bytes = num_bytes[:-1]
-
-    result = int(num_bytes) * factor
-    if result <= 0:
-        raise ValueError("Size out of range")
-
-    if result % 512 != 0:
-        raise ValueError("Size not a multiple of 512")
-
-    return result
-
-
-def detect_distribution() -> Tuple[Optional[Distribution], Optional[str]]:
-    try:
-        f = open("/etc/os-release")
-    except IOError:
-        try:
-            f = open("/usr/lib/os-release")
-        except IOError:
-            return None, None
-
-    dist_id = None
-    version_id = None
-    version_codename = None
-    extracted_codename = None
-
-    for ln in f:
-        if ln.startswith("ID="):
-            dist_id = ln[3:].strip(" \t\n\"'")
-        if ln.startswith("ID_LIKE="):
-            dist_id_like = ln[8:].strip(" \t\n\"'").split()
-        if ln.startswith("VERSION_ID="):
-            version_id = ln[11:].strip(" \t\n\"'")
-        if ln.startswith("VERSION_CODENAME="):
-            version_codename = ln[17:].strip(" \t\n\"'")
-        if ln.startswith("VERSION="):
-            # extract Debian release codename
-            version_str = ln[8:].strip(" \t\n\"'")
-            debian_codename_re = r"\((.*?)\)"
-
-            codename_list = re.findall(debian_codename_re, version_str)
-            if len(codename_list) == 1:
-                extracted_codename = codename_list[0]
-
-    if dist_id == "clear-linux-os":
-        dist_id = "clear"
-
-    d: Optional[Distribution] = None
-    if dist_id is not None:
-        d = Distribution.__members__.get(dist_id, None)
-        if d is None:
-            for dist_id in dist_id_like:
-                d = Distribution.__members__.get(dist_id, None)
-                if d is not None:
-                    break
-
-    if (d == Distribution.debian or d == Distribution.ubuntu) and (version_codename or extracted_codename):
-        # debootstrap needs release codenames, not version numbers
-        if version_codename:
-            version_id = version_codename
-        else:
-            version_id = extracted_codename
-
-    return d, version_id
-
-
-def unlink_try_hard(path: str) -> None:
-    try:
-        os.unlink(path)
-    except:  # NOQA: E722
-        pass
-
-    try:
-        btrfs_subvol_delete(path)
-    except:  # NOQA: E722
-        pass
-
-    try:
-        shutil.rmtree(path)
-    except:  # NOQA: E722
-        pass
-
-
-def remove_glob(*patterns: str) -> None:
-    pathgen = (glob.glob(pattern) for pattern in patterns)
-    paths: Set[str] = set(sum(pathgen, []))  # uniquify
-    for path in paths:
-        unlink_try_hard(path)
-
-
-def empty_directory(path: str) -> None:
-    try:
-        for f in os.listdir(path):
-            unlink_try_hard(os.path.join(path, f))
-    except FileNotFoundError:
-        pass
-
-
-def unlink_output(args: CommandLineArguments) -> None:
-    if not args.force and args.verb != "clean":
-        return
-
-    if not args.skip_final_phase:
-        with complete_step("Removing output files"):
-            unlink_try_hard(args.output)
-
-            if args.checksum:
-                unlink_try_hard(args.output_checksum)
-
-            if args.verity:
-                unlink_try_hard(args.output_root_hash_file)
-
-            if args.sign:
-                unlink_try_hard(args.output_signature)
-
-            if args.bmap:
-                unlink_try_hard(args.output_bmap)
-
-            if args.nspawn_settings is not None:
-                unlink_try_hard(args.output_nspawn_settings)
-
-        if args.ssh:
-            unlink_try_hard(args.output_sshkey)
-
-    # We remove any cached images if either the user used --force
-    # twice, or he/she called "clean" with it passed once. Let's also
-    # remove the downloaded package cache if the user specified one
-    # additional "--force".
-
-    if args.verb == "clean":
-        remove_build_cache = args.force_count > 0
-        remove_package_cache = args.force_count > 1
-    else:
-        remove_build_cache = args.force_count > 1
-        remove_package_cache = args.force_count > 2
-
-    if remove_build_cache:
-        if args.cache_pre_dev is not None or args.cache_pre_inst is not None:
-            with complete_step("Removing incremental cache files"):
-                if args.cache_pre_dev is not None:
-                    unlink_try_hard(args.cache_pre_dev)
-
-                if args.cache_pre_inst is not None:
-                    unlink_try_hard(args.cache_pre_inst)
-
-        if args.build_dir is not None:
-            with complete_step("Clearing out build directory"):
-                empty_directory(args.build_dir)
-
-        if args.include_dir is not None:
-            with complete_step("Clearing out include directory"):
-                empty_directory(args.include_dir)
-
-        if args.install_dir is not None:
-            with complete_step("Clearing out install directory"):
-                empty_directory(args.install_dir)
-
-    if remove_package_cache:
-        if args.cache_path is not None:
-            with complete_step("Clearing out package cache"):
-                empty_directory(args.cache_path)
-
-
-def parse_boolean(s: str) -> bool:
-    "Parse 1/true/yes as true and 0/false/no as false"
-    s_l = s.lower()
-    if s_l in {"1", "true", "yes"}:
-        return True
-
-    if s_l in {"0", "false", "no"}:
-        return False
-
-    raise ValueError(f"Invalid literal for bool(): {s!r}")
-
-
-def find_nspawn_settings(args: CommandLineArguments) -> None:
-    if args.nspawn_settings is not None:
-        return
-
-    if os.path.exists("mkosi.nspawn"):
-        args.nspawn_settings = "mkosi.nspawn"
-
-
-def find_extra(args: CommandLineArguments) -> None:
-
-    if len(args.extra_trees) > 0:
-        return
-
-    if os.path.isdir("mkosi.extra"):
-        args.extra_trees.append("mkosi.extra")
-    if os.path.isfile("mkosi.extra.tar"):
-        args.extra_trees.append("mkosi.extra.tar")
-
-
-def find_skeleton(args: CommandLineArguments) -> None:
-
-    if len(args.skeleton_trees) > 0:
-        return
-
-    if os.path.isdir("mkosi.skeleton"):
-        args.skeleton_trees.append("mkosi.skeleton")
-    if os.path.isfile("mkosi.skeleton.tar"):
-        args.skeleton_trees.append("mkosi.skeleton.tar")
-
-
-def args_find_path(
-    args: CommandLineArguments, name: str, path: str, *, type_call: Callable[[str], Any] = lambda x: x
+    for base in config.base_trees:
+        if not base.exists():
+            die(f"Base tree {base} not found")
+
+    if config.tools_tree and not config.tools_tree.exists():
+        die(f"Tools tree {config.tools_tree} not found")
+
+    for name, trees in (("Skeleton", config.skeleton_trees),
+                        ("Package manager", config.package_manager_trees),
+                        ("Extra", config.extra_trees)):
+        for tree in trees:
+            if not tree.source.exists():
+                die(f"{name} tree {tree.source} not found")
+
+    if config.bootable != ConfigFeature.disabled:
+        for p in config.initrds:
+            if not p.exists():
+                die(f"Initrd {p} not found")
+            if not p.is_file():
+                die(f"Initrd {p} is not a file")
+
+    for script in itertools.chain(
+        config.sync_scripts,
+        config.prepare_scripts,
+        config.build_scripts,
+        config.postinst_scripts,
+        config.finalize_scripts,
+    ):
+        if not os.access(script, os.X_OK):
+            die(f"{script} is not executable")
+
+
+def check_outputs(config: Config) -> None:
+    for f in (
+        config.output_with_compression,
+        config.output_checksum if config.checksum else None,
+        config.output_signature if config.sign else None,
+        config.output_nspawn_settings if config.nspawn_settings else None,
+    ):
+        if f and (config.output_dir_or_cwd() / f).exists():
+            logging.info(f"Output path {f} exists already. (Use --force to rebuild.)")
+
+
+def check_tool(config: Config, *tools: PathString, reason: str, hint: Optional[str] = None) -> Path:
+    tool = config.find_binary(*tools)
+    if not tool:
+        die(f"Could not find '{tools[0]}' which is required to {reason}.", hint=hint)
+
+    return tool
+
+
+def check_systemd_tool(
+    config: Config,
+    *tools: PathString,
+    version: str,
+    reason: str,
+    hint: Optional[str] = None,
 ) -> None:
-    if getattr(args, name) is not None:
+    tool = check_tool(config, *tools, reason=reason, hint=hint)
+
+    v = systemd_tool_version(config, tool)
+    if v < version:
+        die(f"Found '{tool}' with version {v} but version {version} or newer is required to {reason}.",
+            hint=f"Use ToolsTree=default to get a newer version of '{tools[0]}'.")
+
+
+def check_tools(config: Config, verb: Verb) -> None:
+    check_tool(config, "bwrap", reason="execute sandboxed commands")
+
+    if verb == Verb.build:
+        if config.bootable != ConfigFeature.disabled:
+            check_tool(config, "depmod", reason="generate kernel module dependencies")
+
+        if want_efi(config) and config.unified_kernel_images == ConfigFeature.enabled:
+            check_systemd_tool(
+                config,
+                "ukify", "/usr/lib/systemd/ukify",
+                version="254",
+                reason="build bootable images",
+                hint="Use ToolsTree=default to download most required tools including ukify automatically or use "
+                     "Bootable=no to create a non-bootable image which doesn't require ukify",
+            )
+
+        if config.output_format in (OutputFormat.disk, OutputFormat.esp):
+            check_systemd_tool(config, "systemd-repart", version="254", reason="build disk images")
+
+        if config.selinux_relabel == ConfigFeature.enabled:
+            check_tool(config, "setfiles", reason="relabel files")
+
+        if config.secure_boot_key_source.type != KeySource.Type.file:
+            check_systemd_tool(
+                config,
+                "ukify", "/usr/lib/systemd/ukify",
+                version="256~devel",
+                reason="sign Unified Kernel Image with OpenSSL engine",
+            )
+
+            if want_signed_pcrs(config):
+                check_systemd_tool(
+                    config,
+                    "systemd-measure",
+                    version="256~devel",
+                    reason="sign PCR hashes with OpenSSL engine",
+                )
+
+        if config.verity_key_source.type != KeySource.Type.file:
+            check_systemd_tool(
+                config,
+                "systemd-repart",
+                version="256~devel",
+                reason="sign verity roothash signature with OpenSSL engine",
+            )
+
+        if want_efi(config) and config.secure_boot and config.secure_boot_auto_enroll:
+            check_tool(config, "sbsiglist", reason="set up systemd-boot secure boot auto-enrollment")
+            check_tool(config, "sbvarsign", reason="set up systemd-boot secure boot auto-enrollment")
+
+    if verb == Verb.boot:
+        check_systemd_tool(config, "systemd-nspawn", version="254", reason="boot images")
+
+    if verb == Verb.qemu and config.vmm == Vmm.vmspawn:
+        check_systemd_tool(config, "systemd-vmspawn", version="256~devel", reason="boot images with vmspawn")
+
+
+def configure_ssh(context: Context) -> None:
+    if not context.config.ssh:
         return
-    if os.path.exists(path):
-        path = os.path.abspath(path)
-        path = type_call(path)
-        setattr(args, name, path)
 
+    unitdir = context.root / "usr/lib/systemd/system"
+    with umask(~0o755):
+        unitdir.mkdir(parents=True, exist_ok=True)
 
-def find_cache(args: CommandLineArguments) -> None:
-    if args.cache_path is not None:
-        return
+    with umask(~0o644):
+        (unitdir / "ssh.socket").write_text(
+            textwrap.dedent(
+                """\
+                [Unit]
+                Description=Mkosi SSH Server VSock Socket
+                ConditionVirtualization=!container
+                Wants=sshd-keygen.target
 
-    if os.path.exists("mkosi.cache/"):
-        args.cache_path = "mkosi.cache/" + args.distribution.name
+                [Socket]
+                ListenStream=vsock::22
+                Accept=yes
 
-        # Clear has a release number that can be used, however the
-        # cache is valid (and more efficient) across releases.
-        if args.distribution != Distribution.clear and args.release is not None:
-            args.cache_path += "~" + args.release
-
-
-def require_private_file(name: str, description: str) -> None:
-    mode = os.stat(name).st_mode & 0o777
-    if mode & 0o007:
-        warn(
-            dedent(
-                f"""
-                Permissions of '{name}' of '{mode:04o}' are too open.
-                When creating {description} files use an access mode that restricts access to the owner only.\
+                [Install]
+                WantedBy=sockets.target
                 """
             )
         )
 
+        (unitdir / "ssh@.service").write_text(
+            textwrap.dedent(
+                """\
+                [Unit]
+                Description=Mkosi SSH Server
+                After=sshd-keygen.target
 
-def find_passphrase(args: CommandLineArguments) -> None:
-    if args.encrypt is None:
-        args.passphrase = None
+                [Service]
+                # We disable PAM because of an openssh-server bug where it sets PAM_RHOST=UNKNOWN when -i is
+                # used causing a very slow reverse DNS lookup by pam.
+                ExecStart=sshd -i -o UsePAM=no
+                StandardInput=socket
+                RuntimeDirectoryPreserve=yes
+                RuntimeDirectory=sshd
+                # ssh always exits with 255 even on normal disconnect, so let's mark that as success so we
+                # don't get noisy logs about SSH service failures.
+                SuccessExitStatus=255
+                """
+            )
+        )
+
+    preset = context.root / "usr/lib/systemd/system-preset/80-mkosi-ssh.preset"
+    with umask(~0o755):
+        preset.parent.mkdir(parents=True, exist_ok=True)
+    with umask(~0o644):
+        preset.write_text("enable ssh.socket\n")
+
+
+def configure_initrd(context: Context) -> None:
+    if context.config.overlay or context.config.output_format.is_extension_image():
         return
 
-    try:
-        require_private_file("mkosi.passphrase", "passphrase")
+    if (
+        not (context.root / "init").exists() and
+        not (context.root / "init").is_symlink() and
+        (context.root / "usr/lib/systemd/systemd").exists()
+    ):
+        (context.root / "init").symlink_to("/usr/lib/systemd/systemd")
 
-        args.passphrase = {"type": "file", "content": "mkosi.passphrase"}
-
-    except FileNotFoundError:
-        while True:
-            passphrase = getpass.getpass("Please enter passphrase: ")
-            passphrase_confirmation = getpass.getpass("Passphrase confirmation: ")
-            if passphrase == passphrase_confirmation:
-                args.passphrase = {"type": "stdin", "content": passphrase}
-                break
-
-            MkosiPrinter.info("Passphrase doesn't match confirmation. Please try again.")
-
-
-def find_password(args: CommandLineArguments) -> None:
-    if args.password is not None:
+    if not context.config.make_initrd:
         return
 
-    try:
-        require_private_file("mkosi.rootpw", "root password")
-
-        with open("mkosi.rootpw") as f:
-            args.password = f.read().strip()
-
-    except FileNotFoundError:
-        pass
+    if not (context.root / "etc/initrd-release").exists() and not (context.root / "etc/initrd-release").is_symlink():
+        (context.root / "etc/initrd-release").symlink_to("/etc/os-release")
 
 
-def find_secure_boot(args: CommandLineArguments) -> None:
-    if not args.secure_boot:
+def configure_clock(context: Context) -> None:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
         return
 
-    if args.secure_boot_key is None:
-        if os.path.exists("mkosi.secure-boot.key"):
-            args.secure_boot_key = "mkosi.secure-boot.key"
-
-    if args.secure_boot_certificate is None:
-        if os.path.exists("mkosi.secure-boot.crt"):
-            args.secure_boot_certificate = "mkosi.secure-boot.crt"
+    with umask(~0o644):
+        (context.root / "usr/lib/clock-epoch").touch()
 
 
-def strip_suffixes(path: str) -> str:
-    t = path
-    while True:
-        if t.endswith(".xz"):
-            t = t[:-3]
-        elif t.endswith(".raw"):
-            t = t[:-4]
-        elif t.endswith(".tar"):
-            t = t[:-4]
-        elif t.endswith(".qcow2"):
-            t = t[:-6]
-        else:
-            break
+def run_depmod(context: Context, *, cache: bool = False) -> None:
+    if context.config.overlay or context.config.output_format.is_extension_image():
+        return
 
-    return t
+    outputs = (
+        "modules.dep",
+        "modules.dep.bin",
+        "modules.symbols",
+        "modules.symbols.bin",
+    )
 
+    for kver, _ in gen_kernel_images(context):
+        modulesd = context.root / "usr/lib/modules" / kver
 
-def build_nspawn_settings_path(path: str) -> str:
-    return strip_suffixes(path) + ".nspawn"
+        if (
+            not cache and
+            not context.config.kernel_modules_exclude and
+            all((modulesd / o).exists() for o in outputs)
+        ):
+            mtime = (modulesd / "modules.dep").stat().st_mtime
+            if all(m.stat().st_mtime <= mtime for m in modulesd.rglob("*.ko*")):
+                continue
 
-
-def build_root_hash_file_path(path: str) -> str:
-    return strip_suffixes(path) + ".roothash"
-
-
-def check_valid_script(path: str) -> None:
-    if not os.path.exists(path):
-        die(f"{path} does not exist")
-    if not os.path.isfile(path):
-        die(f"{path} is not a file")
-    if not os.access(path, os.X_OK):
-        die(f"{path} is not executable")
-
-
-def load_args(args: CommandLineArguments) -> CommandLineArguments:
-    global arg_debug
-    arg_debug = args.debug
-
-    args_find_path(args, "nspawn_settings", "mkosi.nspawn")
-    args_find_path(args, "build_script", "mkosi.build")
-    args_find_path(args, "build_sources", ".")
-    args_find_path(args, "build_dir", "mkosi.builddir/")
-    args_find_path(args, "include_dir", "mkosi.includedir/")
-    args_find_path(args, "install_dir", "mkosi.installdir/")
-    args_find_path(args, "postinst_script", "mkosi.postinst")
-    args_find_path(args, "prepare_script", "mkosi.prepare")
-    args_find_path(args, "finalize_script", "mkosi.finalize")
-    args_find_path(args, "output_dir", "mkosi.output/")
-    args_find_path(args, "mksquashfs_tool", "mkosi.mksquashfs-tool", type_call=lambda x: [x])
-
-    find_extra(args)
-    find_skeleton(args)
-    find_password(args)
-    find_passphrase(args)
-    find_secure_boot(args)
-
-    args.extra_search_paths = expand_paths(args.extra_search_paths)
-
-    if args.cmdline and args.verb not in MKOSI_COMMANDS_CMDLINE:
-        die("Additional parameters only accepted for " + str(MKOSI_COMMANDS_CMDLINE)[1:-1] + " invocations.")
-
-    args.force = args.force_count > 0
-
-    if args.output_format is None:
-        args.output_format = OutputFormat.gpt_ext4
-
-    args = load_distribution(args)
-
-    if args.release is None:
-        if args.distribution == Distribution.fedora:
-            args.release = "33"
-        elif args.distribution in (Distribution.centos, Distribution.centos_epel):
-            args.release = "8"
-        elif args.distribution == Distribution.mageia:
-            args.release = "7"
-        elif args.distribution == Distribution.debian:
-            args.release = "unstable"
-        elif args.distribution == Distribution.ubuntu:
-            args.release = "focal"
-        elif args.distribution == Distribution.opensuse:
-            args.release = "tumbleweed"
-        elif args.distribution == Distribution.clear:
-            args.release = "latest"
-        elif args.distribution == Distribution.photon:
-            args.release = "3.0"
-        elif args.distribution == Distribution.openmandriva:
-            args.release = "cooker"
-
-    if args.distribution in (Distribution.centos, Distribution.centos_epel):
-        epel_release = int(args.release.split(".")[0])
-        if epel_release <= 8 and args.output_format == OutputFormat.gpt_btrfs:
-            die(f"Sorry, CentOS {epel_release} does not support btrfs")
-        if epel_release <= 7 and args.bootable and "uefi" in args.boot_protocols and args.with_unified_kernel_images:
-            die(
-                f"Sorry, CentOS {epel_release} does not support unified kernel images. "
-                "You must use --without-unified-kernel-images."
+        if not cache:
+            process_kernel_modules(
+                context.root, kver,
+                include=context.config.kernel_modules_include,
+                exclude=context.config.kernel_modules_exclude,
+                host=context.config.kernel_modules_include_host,
+                sandbox=context.sandbox,
             )
 
-    # Remove once https://github.com/clearlinux/clr-boot-manager/pull/238 is merged and available.
-    if args.distribution == Distribution.clear and args.output_format == OutputFormat.gpt_btrfs:
-        die("Sorry, Clear Linux does not support btrfs")
-
-    if args.distribution == Distribution.clear and "," in args.boot_protocols:
-        die("Sorry, Clear Linux does not support hybrid BIOS/UEFI images")
-
-    if shutil.which("bsdtar") and args.distribution == Distribution.openmandriva and args.tar_strip_selinux_context:
-        die("Sorry, bsdtar on OpenMandriva is incompatible with --tar-strip-selinux-context")
-
-    find_cache(args)
-
-    if args.mirror is None:
-        if args.distribution in (Distribution.fedora, Distribution.centos):
-            args.mirror = None
-        elif args.distribution == Distribution.debian:
-            args.mirror = "http://deb.debian.org/debian"
-        elif args.distribution == Distribution.ubuntu:
-            args.mirror = "http://archive.ubuntu.com/ubuntu"
-            if platform.machine() == "aarch64":
-                args.mirror = "http://ports.ubuntu.com/"
-        elif args.distribution == Distribution.arch and platform.machine() == "aarch64":
-            args.mirror = "http://mirror.archlinuxarm.org"
-        elif args.distribution == Distribution.opensuse:
-            args.mirror = "http://download.opensuse.org"
-
-    if args.minimize and not args.output_format.can_minimize():
-        die("Minimal file systems only supported for ext4 and btrfs.")
-
-    if args.generated_root() and args.incremental:
-        die("Sorry, incremental mode is currently not supported for squashfs or minimized file systems.")
-
-    if args.bootable:
-        if args.output_format in (
-            OutputFormat.directory,
-            OutputFormat.subvolume,
-            OutputFormat.tar,
-            OutputFormat.plain_squashfs,
-        ):
-            die("Directory, subvolume, tar and plain squashfs images cannot be booted.")
-
-        if not args.boot_protocols:
-            args.boot_protocols = ["uefi"]
-
-            if args.distribution == Distribution.photon:
-                args.boot_protocols = ["bios"]
-
-        if not {"uefi", "bios"}.issuperset(args.boot_protocols):
-            die("Not a valid boot protocol")
-
-        if "uefi" in args.boot_protocols and args.distribution == Distribution.photon:
-            die(f"uefi boot not supported for {args.distribution}")
-
-    if args.encrypt is not None:
-        if not args.output_format.is_disk():
-            die("Encryption is only supported for disk images.")
-
-        if args.encrypt == "data" and args.output_format == OutputFormat.gpt_btrfs:
-            die("'data' encryption mode not supported on btrfs, use 'all' instead.")
-
-        if args.encrypt == "all" and args.verity:
-            die("'all' encryption mode may not be combined with Verity.")
-
-    if args.sign:
-        args.checksum = True
-
-    if args.output is None:
-        if args.output_format.is_disk():
-            args.output = "image" + (".qcow2" if args.qcow2 else ".raw") + (".xz" if args.xz else "")
-        elif args.output_format == OutputFormat.tar:
-            args.output = "image.tar.xz"
-        else:
-            args.output = "image"
-
-    if args.output_dir is not None:
-        args.output_dir = os.path.abspath(args.output_dir)
-
-        if "/" not in args.output:
-            args.output = os.path.join(args.output_dir, args.output)
-        else:
-            warn("Ignoring configured output directory as output file is a qualified path.")
-
-    if args.incremental or args.verb == "clean":
-        args.cache_pre_dev = args.output + ".cache-pre-dev"
-        args.cache_pre_inst = args.output + ".cache-pre-inst"
-    else:
-        args.cache_pre_dev = None
-        args.cache_pre_inst = None
-
-    args.output = os.path.abspath(args.output)
-
-    if args.output_format == OutputFormat.tar:
-        args.xz = True
-
-    if args.output_format.is_squashfs():
-        args.read_only = True
-        args.root_size = None
-        if args.compress is False:
-            die("Cannot disable compression with squashfs")
-        if args.compress is None:
-            args.compress = True
-
-    if args.verity:
-        args.read_only = True
-        args.output_root_hash_file = build_root_hash_file_path(args.output)
-
-    if args.checksum:
-        args.output_checksum = os.path.join(os.path.dirname(args.output), "SHA256SUMS")
-
-    if args.sign:
-        args.output_signature = os.path.join(os.path.dirname(args.output), "SHA256SUMS.gpg")
-
-    if args.bmap:
-        args.output_bmap = args.output + ".bmap"
-
-    if args.nspawn_settings is not None:
-        args.nspawn_settings = os.path.abspath(args.nspawn_settings)
-        args.output_nspawn_settings = build_nspawn_settings_path(args.output)
-
-    # We want this set even if --ssh is not specified so we can find the SSH key when verb == "ssh".
-    args.output_sshkey = os.path.join(os.path.dirname(args.output), "id_rsa")
-
-    if args.build_script is not None:
-        check_valid_script(args.build_script)
-        args.build_script = os.path.abspath(args.build_script)
-
-    if args.build_sources is not None:
-        args.build_sources = os.path.abspath(args.build_sources)
-
-    if args.build_dir is not None:
-        args.build_dir = os.path.abspath(args.build_dir)
-
-    if args.include_dir is not None:
-        args.include_dir = os.path.abspath(args.include_dir)
-
-    if args.install_dir is not None:
-        args.install_dir = os.path.abspath(args.install_dir)
-
-    if args.postinst_script is not None:
-        check_valid_script(args.postinst_script)
-        args.postinst_script = os.path.abspath(args.postinst_script)
-
-    if args.prepare_script is not None:
-        check_valid_script(args.prepare_script)
-        args.prepare_script = os.path.abspath(args.prepare_script)
-
-    if args.finalize_script is not None:
-        check_valid_script(args.finalize_script)
-        args.finalize_script = os.path.abspath(args.finalize_script)
-
-    if args.cache_path is not None:
-        args.cache_path = os.path.abspath(args.cache_path)
-
-    if args.extra_trees:
-        for i in range(len(args.extra_trees)):
-            args.extra_trees[i] = os.path.abspath(args.extra_trees[i])
-
-    if args.skeleton_trees is not None:
-        for i in range(len(args.skeleton_trees)):
-            args.skeleton_trees[i] = os.path.abspath(args.skeleton_trees[i])
-
-    args.root_size = parse_bytes(args.root_size)
-    args.home_size = parse_bytes(args.home_size)
-    args.srv_size = parse_bytes(args.srv_size)
-    args.var_size = parse_bytes(args.var_size)
-    args.tmp_size = parse_bytes(args.tmp_size)
-    args.esp_size = parse_bytes(args.esp_size)
-    args.xbootldr_size = parse_bytes(args.xbootldr_size)
-    args.swap_size = parse_bytes(args.swap_size)
-
-    if args.root_size is None:
-        args.root_size = 3 * 1024 * 1024 * 1024
-
-    if args.bootable and args.esp_size is None:
-        args.esp_size = 256 * 1024 * 1024
-
-    args.verity_size = None
-
-    if args.secure_boot_key is not None:
-        args.secure_boot_key = os.path.abspath(args.secure_boot_key)
-
-    if args.secure_boot_certificate is not None:
-        args.secure_boot_certificate = os.path.abspath(args.secure_boot_certificate)
-
-    if args.secure_boot:
-        if args.secure_boot_key is None:
-            die(
-                "UEFI SecureBoot enabled, but couldn't find private key. (Consider placing it in mkosi.secure-boot.key?)"
-            )  # NOQA: E501
-
-        if args.secure_boot_certificate is None:
-            die(
-                "UEFI SecureBoot enabled, but couldn't find certificate. (Consider placing it in mkosi.secure-boot.crt?)"
-            )  # NOQA: E501
-
-    if args.verb in ("shell", "boot"):
-        if args.output_format == OutputFormat.tar:
-            die("Sorry, can't acquire shell in or boot a tar archive.")
-        if args.xz:
-            die("Sorry, can't acquire shell in or boot an XZ compressed image.")
-        if args.qcow2:
-            die("Sorry, can't acquire shell in or boot a qcow2 image.")
-
-    if args.verb == "qemu":
-        if not args.output_format.is_disk():
-            die("Sorry, can't boot non-disk images with qemu.")
-
-    if needs_build(args) and args.qemu_headless and not args.bootable:
-        die("--qemu-headless requires --bootable")
-
-    if args.qemu_headless and "console=ttyS0" not in args.kernel_command_line:
-        args.kernel_command_line.append("console=ttyS0")
-
-    if args.bootable and args.distribution == Distribution.mageia:
-        # TODO: Remove once dracut 045 is available in mageia.
-        args.kernel_command_line.append("root=/dev/gpt-auto-root")
-
-    if not args.read_only:
-        args.kernel_command_line.append("rw")
-
-    if args.generated_root() and "bios" in args.boot_protocols:
-        die("Sorry, BIOS cannot be combined with --minimize or squashfs filesystems")
-
-    if args.bootable and args.distribution in (Distribution.clear, Distribution.photon):
-        die("Sorry, --bootable is not supported on this distro")
-
-    if not args.with_unified_kernel_images and "uefi" in args.boot_protocols:
-        if args.distribution in (Distribution.debian, Distribution.ubuntu, Distribution.mageia, Distribution.opensuse):
-            die("Sorry, --without-unified-kernel-images is not supported in UEFI mode on this distro.")
-
-    if args.verity and not args.with_unified_kernel_images:
-        die("Sorry, --verity can only be used with unified kernel images")
-
-    if args.source_file_transfer is None:
-        if os.path.exists(".git") or os.path.exists(os.path.join(args.build_sources, ".git")):
-            args.source_file_transfer = SourceFileTransfer.copy_git_others
-        else:
-            args.source_file_transfer = SourceFileTransfer.copy_all
-
-    if args.source_file_transfer_final == SourceFileTransfer.mount:
-        die("Sorry, --source-file-transfer-final=mount is not supported")
-
-    if args.skip_final_phase and args.verb != "build":
-        die("--skip-final-phase can only be used when building an image using `mkosi build`")
-
-    if args.ssh and not args.network_veth:
-        die("--ssh cannot be used without --network-veth")
-
-    return args
-
-
-def check_output(args: CommandLineArguments) -> None:
-    if args.skip_final_phase:
+        with complete_step(f"Running depmod for {kver}"):
+            run(
+                ["depmod", "--all", kver],
+                sandbox=context.sandbox(
+                    binary=None,
+                    mounts=[Mount(context.root, "/buildroot")],
+                    extra=chroot_cmd(),
+                )
+            )
+
+
+def run_sysusers(context: Context) -> None:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
         return
 
-    for f in (
-        args.output,
-        args.output_checksum if args.checksum else None,
-        args.output_signature if args.sign else None,
-        args.output_bmap if args.bmap else None,
-        args.output_nspawn_settings if args.nspawn_settings is not None else None,
-        args.output_root_hash_file if args.verity else None,
-        args.output_sshkey if args.ssh else None,
-    ):
+    if not context.config.find_binary("systemd-sysusers"):
+        logging.warning("systemd-sysusers is not installed, not generating system users")
+        return
 
-        if f is None:
+    with complete_step("Generating system users"):
+        run(["systemd-sysusers", "--root=/buildroot"],
+            sandbox=context.sandbox(binary="systemd-sysusers", mounts=[Mount(context.root, "/buildroot")]))
+
+
+def run_tmpfiles(context: Context) -> None:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+        return
+
+    if not context.config.find_binary("systemd-tmpfiles"):
+        logging.warning("systemd-tmpfiles is not installed, not generating volatile files")
+        return
+
+    with complete_step("Generating volatile files"):
+        run(
+            [
+                "systemd-tmpfiles",
+                "--root=/buildroot",
+                "--boot",
+                "--create",
+                "--remove",
+                # Exclude APIVFS and temporary files directories.
+                *(f"--exclude-prefix={d}" for d in ("/tmp", "/var/tmp", "/run", "/proc", "/sys", "/dev")),
+            ],
+            env={"SYSTEMD_TMPFILES_FORCE_SUBVOL": "0"},
+            # systemd-tmpfiles can exit with DATAERR or CANTCREAT in some cases which are handled as success by the
+            # systemd-tmpfiles service so we handle those as success as well.
+            success_exit_status=(0, 65, 73),
+            sandbox=context.sandbox(
+                binary="systemd-tmpfiles",
+                mounts=[
+                    Mount(context.root, "/buildroot"),
+                    # systemd uses acl.h to parse ACLs in tmpfiles snippets which uses the host's passwd so we have to
+                    # mount the image's passwd over it to make ACL parsing work.
+                    *finalize_passwd_mounts(context.root)
+                ],
+            ),
+        )
+
+
+def run_preset(context: Context) -> None:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+        return
+
+    if not context.config.find_binary("systemctl"):
+        logging.warning("systemctl is not installed, not applying presets")
+        return
+
+    with complete_step("Applying presets…"):
+        run(["systemctl", "--root=/buildroot", "preset-all"],
+            sandbox=context.sandbox(binary="systemctl", mounts=[Mount(context.root, "/buildroot")]))
+        run(["systemctl", "--root=/buildroot", "--global", "preset-all"],
+            sandbox=context.sandbox(binary="systemctl", mounts=[Mount(context.root, "/buildroot")]))
+
+
+def run_hwdb(context: Context) -> None:
+    if context.config.overlay or context.config.output_format in (OutputFormat.sysext, OutputFormat.confext):
+        return
+
+    if not context.config.find_binary("systemd-hwdb"):
+        logging.warning("systemd-hwdb is not installed, not generating hwdb")
+        return
+
+    with complete_step("Generating hardware database"):
+        run(["systemd-hwdb", "--root=/buildroot", "--usr", "--strict", "update"],
+            sandbox=context.sandbox(binary="systemd-hwdb", mounts=[Mount(context.root, "/buildroot")]))
+
+    # Remove any existing hwdb in /etc in favor of the one we just put in /usr.
+    (context.root / "etc/udev/hwdb.bin").unlink(missing_ok=True)
+
+
+def run_firstboot(context: Context) -> None:
+    if context.config.overlay or context.config.output_format.is_extension_image():
+        return
+
+    if not context.config.find_binary("systemd-firstboot"):
+        logging.warning("systemd-firstboot is not installed, not applying first boot settings")
+        return
+
+    password, hashed = context.config.root_password or (None, False)
+    if password and not hashed:
+        password = run(
+            ["openssl", "passwd", "-stdin", "-6"],
+            sandbox=context.sandbox(binary="openssl"),
+            input=password,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    settings = (
+        ("--locale",               "firstboot.locale",            context.config.locale),
+        ("--locale-messages",      "firstboot.locale-messages",   context.config.locale_messages),
+        ("--keymap",               "firstboot.keymap",            context.config.keymap),
+        ("--timezone",             "firstboot.timezone",          context.config.timezone),
+        ("--hostname",             None,                          context.config.hostname),
+        ("--root-password-hashed", "passwd.hashed-password.root", password),
+        ("--root-shell",           "passwd.shell.root",           context.config.root_shell),
+    )
+
+    options = []
+    creds = []
+
+    for option, cred, value in settings:
+        # Check for None as password might be the empty string
+        if value is None:
             continue
 
-        if os.path.exists(f):
-            die("Output file " + f + " exists already. (Consider invocation with --force.)")
+        options += [option, value]
+
+        if cred:
+            creds += [(cred, value)]
+
+    if not options and not creds:
+        return
+
+    with complete_step("Applying first boot settings"):
+        run(["systemd-firstboot", "--root=/buildroot", "--force", *options],
+            sandbox=context.sandbox(binary="systemd-firstboot", mounts=[Mount(context.root, "/buildroot")]))
+
+        # Initrds generally don't ship with only /usr so there's not much point in putting the credentials in
+        # /usr/lib/credstore.
+        if context.config.output_format != OutputFormat.cpio or not context.config.make_initrd:
+            with umask(~0o755):
+                (context.root / "usr/lib/credstore").mkdir(exist_ok=True)
+
+            for cred, value in creds:
+                with umask(~0o600 if "password" in cred else ~0o644):
+                    (context.root / "usr/lib/credstore" / cred).write_text(value)
 
 
-def yes_no(b: bool) -> str:
-    return "yes" if b else "no"
+def run_selinux_relabel(context: Context) -> None:
+    if not (selinux := want_selinux_relabel(context.config, context.root)):
+        return
+
+    setfiles, policy, fc, binpolicy = selinux
+    fc = Path("/buildroot") / fc.relative_to(context.root)
+    binpolicy = Path("/buildroot") / binpolicy.relative_to(context.root)
+
+    with complete_step(f"Relabeling files using {policy} policy"):
+        run([setfiles, "-mFr", "/buildroot", "-c", binpolicy, fc, "/buildroot"],
+            sandbox=context.sandbox(binary=setfiles, mounts=[Mount(context.root, "/buildroot")]),
+            check=context.config.selinux_relabel == ConfigFeature.enabled)
 
 
-def format_bytes_or_disabled(sz: Optional[int]) -> str:
-    if sz is None:
-        return "(disabled)"
-
-    return format_bytes(sz)
+def need_build_overlay(config: Config) -> bool:
+    return bool(config.build_scripts and (config.build_packages or config.prepare_scripts))
 
 
-def format_bytes_or_auto(sz: Optional[int]) -> str:
-    if sz is None:
-        return "(automatic)"
+def save_cache(context: Context) -> None:
+    if not context.config.incremental or context.config.overlay:
+        return
 
-    return format_bytes(sz)
+    final, build, manifest = cache_tree_paths(context.config)
 
+    with complete_step("Installing cache copies"):
+        rmtree(final, sandbox=context.sandbox)
 
-def none_to_na(s: Optional[str]) -> str:
-    return "n/a" if s is None else s
+        # We only use the cache-overlay directory for caching if we have a base tree, otherwise we just
+        # cache the root directory.
+        if (context.workspace / "cache-overlay").exists():
+            move_tree(
+                context.workspace / "cache-overlay", final,
+                use_subvolumes=context.config.use_subvolumes,
+                sandbox=context.sandbox,
+            )
+        else:
+            move_tree(
+                context.root, final,
+                use_subvolumes=context.config.use_subvolumes,
+                sandbox=context.sandbox,
+            )
 
+        if need_build_overlay(context.config) and (context.workspace / "build-overlay").exists():
+            rmtree(build, sandbox=context.sandbox)
+            move_tree(
+                context.workspace / "build-overlay", build,
+                use_subvolumes=context.config.use_subvolumes,
+                sandbox=context.sandbox,
+            )
 
-def none_to_no(s: Optional[str]) -> str:
-    return "no" if s is None else s
-
-
-def none_to_none(o: Optional[object]) -> str:
-    return "none" if o is None else str(o)
-
-
-def line_join_list(ary: List[str]) -> str:
-
-    if not ary:
-        return "none"
-
-    return "\n                        ".join(ary)
-
-
-def print_summary(args: CommandLineArguments) -> None:
-    # FIXME: normal print
-    MkosiPrinter.info("COMMANDS:")
-    MkosiPrinter.info("                      verb: " + args.verb)
-    try:
-        MkosiPrinter.info("                   cmdline: " + " ".join(args.cmdline))
-    except AttributeError:
-        pass
-    MkosiPrinter.info("\nDISTRIBUTION:")
-    MkosiPrinter.info("              Distribution: " + args.distribution.name)
-    MkosiPrinter.info("                   Release: " + none_to_na(args.release))
-    if args.architecture:
-        MkosiPrinter.info("              Architecture: " + args.architecture)
-    if args.mirror is not None:
-        MkosiPrinter.info("                    Mirror: " + args.mirror)
-    if args.repositories is not None and len(args.repositories) > 0:
-        MkosiPrinter.info("              Repositories: " + ",".join(args.repositories))
-    MkosiPrinter.info("\nOUTPUT:")
-    if args.hostname:
-        MkosiPrinter.info("                  Hostname: " + args.hostname)
-    MkosiPrinter.info("             Output Format: " + args.output_format.name)
-    if args.output_format.can_minimize():
-        MkosiPrinter.info("                  Minimize: " + yes_no(args.minimize))
-    if args.output_dir:
-        MkosiPrinter.info("          Output Directory: " + args.output_dir)
-    MkosiPrinter.info("                    Output: " + args.output)
-    MkosiPrinter.info("           Output Checksum: " + none_to_na(args.output_checksum if args.checksum else None))
-    MkosiPrinter.info("          Output Signature: " + none_to_na(args.output_signature if args.sign else None))
-    MkosiPrinter.info("               Output Bmap: " + none_to_na(args.output_bmap if args.bmap else None))
-    MkosiPrinter.info(
-        "    Output nspawn Settings: "
-        + none_to_na(args.output_nspawn_settings if args.nspawn_settings is not None else None)
-    )  # NOQA: E501
-    MkosiPrinter.info("            Output SSH key: " + none_to_na(args.output_sshkey if args.ssh else None))
-    MkosiPrinter.info("               Incremental: " + yes_no(args.incremental))
-
-    MkosiPrinter.info("                 Read-only: " + yes_no(args.read_only))
-    detail = " ({})".format(args.compress) if args.compress and not isinstance(args.compress, bool) else ""
-    MkosiPrinter.info("            FS Compression: " + yes_no(args.compress) + detail)
-
-    MkosiPrinter.info("            XZ Compression: " + yes_no(args.xz))
-    if args.mksquashfs_tool:
-        MkosiPrinter.info("           Mksquashfs tool: " + " ".join(args.mksquashfs_tool))
-
-    if args.output_format.is_disk():
-        MkosiPrinter.info("                     QCow2: " + yes_no(args.qcow2))
-
-    MkosiPrinter.info("                Encryption: " + none_to_no(args.encrypt))
-    MkosiPrinter.info("                    Verity: " + yes_no(args.verity))
-
-    if args.output_format.is_disk():
-        MkosiPrinter.info("                  Bootable: " + yes_no(args.bootable))
-
-        if args.bootable:
-            MkosiPrinter.info("       Kernel Command Line: " + " ".join(args.kernel_command_line))
-            MkosiPrinter.info("           UEFI SecureBoot: " + yes_no(args.secure_boot))
-
-            if args.secure_boot:
-                MkosiPrinter.info("       UEFI SecureBoot Key: " + args.secure_boot_key)
-                MkosiPrinter.info("     UEFI SecureBoot Cert.: " + args.secure_boot_certificate)
-
-            MkosiPrinter.info("            Boot Protocols: " + line_join_list(args.boot_protocols))
-            MkosiPrinter.info("     Unified Kernel Images: " + yes_no(args.with_unified_kernel_images))
-            MkosiPrinter.info("             GPT First LBA: " + str(args.gpt_first_lba))
-            MkosiPrinter.info("           Hostonly Initrd: " + yes_no(args.hostonly_initrd))
-
-    MkosiPrinter.info("\nPACKAGES:")
-    MkosiPrinter.info("                  Packages: " + line_join_list(args.packages))
-
-    if args.distribution in (Distribution.fedora, Distribution.centos, Distribution.centos_epel, Distribution.mageia):
-        MkosiPrinter.info("    With Documentation: " + yes_no(args.with_docs))
-
-    MkosiPrinter.info("             Package Cache: " + none_to_none(args.cache_path))
-    MkosiPrinter.info("               Extra Trees: " + line_join_list(args.extra_trees))
-    MkosiPrinter.info("            Skeleton Trees: " + line_join_list(args.skeleton_trees))
-    MkosiPrinter.info("              Build Script: " + none_to_none(args.build_script))
-    MkosiPrinter.info("         Build Environment: " + line_join_list(args.build_env))
-
-    if args.build_script:
-        MkosiPrinter.info("             Run tests: " + yes_no(args.with_tests))
-
-    MkosiPrinter.info("             Build Sources: " + none_to_none(args.build_sources))
-    MkosiPrinter.info("      Source File Transfer: " + none_to_none(args.source_file_transfer))
-    MkosiPrinter.info("Source File Transfer Final: " + none_to_none(args.source_file_transfer_final))
-    MkosiPrinter.info("           Build Directory: " + none_to_none(args.build_dir))
-    MkosiPrinter.info("         Include Directory: " + none_to_none(args.include_dir))
-    MkosiPrinter.info("         Install Directory: " + none_to_none(args.install_dir))
-    MkosiPrinter.info("            Build Packages: " + line_join_list(args.build_packages))
-    MkosiPrinter.info("          Skip final phase: " + yes_no(args.skip_final_phase))
-    MkosiPrinter.info("        Postinstall Script: " + none_to_none(args.postinst_script))
-    MkosiPrinter.info("            Prepare Script: " + none_to_none(args.prepare_script))
-    MkosiPrinter.info("           Finalize Script: " + none_to_none(args.finalize_script))
-    MkosiPrinter.info("      Scripts with network: " + yes_no(args.with_network))
-    MkosiPrinter.info("           nspawn Settings: " + none_to_none(args.nspawn_settings))
-
-    if args.output_format.is_disk():
-        MkosiPrinter.info("\nPARTITIONS:")
-        MkosiPrinter.info("            Root Partition: " + format_bytes_or_auto(args.root_size))
-        MkosiPrinter.info("            Swap Partition: " + format_bytes_or_disabled(args.swap_size))
-        if "uefi" in args.boot_protocols:
-            MkosiPrinter.info("                       ESP: " + format_bytes_or_disabled(args.esp_size))
-        if "bios" in args.boot_protocols:
-            MkosiPrinter.info("                      BIOS: " + format_bytes_or_disabled(BIOS_PARTITION_SIZE))
-        MkosiPrinter.info("        XBOOTLDR Partition: " + format_bytes_or_disabled(args.xbootldr_size))
-        MkosiPrinter.info("           /home Partition: " + format_bytes_or_disabled(args.home_size))
-        MkosiPrinter.info("            /srv Partition: " + format_bytes_or_disabled(args.srv_size))
-        MkosiPrinter.info("            /var Partition: " + format_bytes_or_disabled(args.var_size))
-        MkosiPrinter.info("        /var/tmp Partition: " + format_bytes_or_disabled(args.tmp_size))
-
-        MkosiPrinter.info("\nVALIDATION:")
-        MkosiPrinter.info("                  Checksum: " + yes_no(args.checksum))
-        MkosiPrinter.info("                      Sign: " + yes_no(args.sign))
-        MkosiPrinter.info("                   GPG Key: " + ("default" if args.key is None else args.key))
-        MkosiPrinter.info("                  Password: " + ("default" if args.password is None else "set"))
-        MkosiPrinter.info("                 Autologin: " + yes_no(args.autologin))
-
-    MkosiPrinter.info("\nHOST CONFIGURATION:")
-    MkosiPrinter.info("        Extra search paths: " + line_join_list(args.extra_search_paths))
-    MkosiPrinter.info("             QEMU Headless: " + yes_no(args.qemu_headless))
-    MkosiPrinter.info("              Network Veth: " + yes_no(args.network_veth))
+        manifest.write_text(
+            json.dumps(
+                context.config.cache_manifest(),
+                cls=JsonEncoder,
+                indent=4,
+                sort_keys=True,
+            )
+        )
 
 
-def reuse_cache_tree(
-    args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool, cached: bool
-) -> bool:
-    """If there's a cached version of this tree around, use it and
-    initialize our new root directly from it. Returns a boolean indicating
-    whether we are now operating on a cached version or not."""
-
-    if cached:
-        return True
-
-    if not args.incremental:
-        return False
-    if for_cache:
-        return False
-    if args.output_format.is_disk_rw():
+def have_cache(config: Config) -> bool:
+    if not config.incremental or config.overlay:
         return False
 
-    fname = args.cache_pre_dev if do_run_build_script else args.cache_pre_inst
-    if fname is None:
+    final, build, manifest = cache_tree_paths(config)
+    if not final.exists():
+        logging.info(f"{final} does not exist, not reusing cached images")
         return False
 
-    with complete_step("Copying in cached tree " + fname):
-        try:
-            copy_path(fname, root)
-        except FileNotFoundError:
+    if need_build_overlay(config) and not build.exists():
+        logging.info(f"{build} does not exist, not reusing cached images")
+        return False
+
+    if manifest.exists():
+        prev = json.loads(manifest.read_text())
+        new = json.dumps(config.cache_manifest(), cls=JsonEncoder, indent=4, sort_keys=True)
+        if prev != json.loads(new):
+            logging.info("Cache manifest mismatch, not reusing cached images")
+            if ARG_DEBUG.get():
+                run(["diff", manifest, "-"], input=new, check=False,
+                    sandbox=config.sandbox(binary="diff", mounts=[Mount(manifest, manifest)]))
+
             return False
+    else:
+        logging.info(f"{manifest} does not exist, not reusing cached images")
+        return False
 
     return True
 
 
-def make_output_dir(args: CommandLineArguments) -> None:
-    """Create the output directory if set and not existing yet"""
-    if args.output_dir is None:
-        return
+def reuse_cache(context: Context) -> bool:
+    if not have_cache(context.config):
+        return False
 
-    mkdir_last(args.output_dir, 0o755)
+    final, build, _ = cache_tree_paths(context.config)
 
-
-def make_build_dir(args: CommandLineArguments) -> None:
-    """Create the build directory if set and not existing yet"""
-    if args.build_dir is None:
-        return
-
-    mkdir_last(args.build_dir, 0o755)
-
-
-def setup_ssh(
-    args: CommandLineArguments, root: str, do_run_build_script: bool, for_cache: bool, cached: bool
-) -> Optional[TextIO]:
-    if do_run_build_script or not args.ssh:
-        return None
-
-    if args.distribution in (Distribution.debian, Distribution.ubuntu):
-        unit = "ssh"
-    else:
-        unit = "sshd"
-
-    # We cache the enable sshd step but not the keygen step because it creates a separate file on the host
-    # which introduces non-trivial issue when trying to cache it.
-
-    if not cached:
-        run(["systemctl", "--root", root, "enable", unit])
-
-    if for_cache:
-        return None
-
-    f: TextIO = cast(
-        TextIO,
-        tempfile.NamedTemporaryFile(
-            mode="w+", prefix=".mkosi-", encoding="utf-8", dir=os.path.dirname(args.output_sshkey)
-        ),
-    )
-
-    with complete_step("Generating SSH keypair"):
-        # Write a 'y' to confirm to overwrite the file.
-        run(
-            ["ssh-keygen", "-f", f.name, "-N", args.password or "", "-C", "mkosi", "-t", "ed25519"],
-            input=f"y\n",
-            text=True,
-            stdout=DEVNULL,
+    with complete_step("Copying cached trees"):
+        copy_tree(
+            final, context.root,
+            use_subvolumes=context.config.use_subvolumes,
+            sandbox=context.sandbox,
         )
 
-    copy_file(f"{f.name}.pub", os.path.join(root, "root/.ssh/authorized_keys"))
-    os.remove(f"{f.name}.pub")
+        if need_build_overlay(context.config):
+            (context.workspace / "build-overlay").symlink_to(build)
 
-    os.chmod(os.path.join(root, "root/.ssh/authorized_keys"), 0o600)
-
-    return f
+    return True
 
 
-def setup_network_veth(args: CommandLineArguments, root: str, do_run_build_script: bool, cached: bool) -> None:
-    if do_run_build_script or cached or not args.network_veth:
-        return
+def save_uki_components(context: Context) -> tuple[Optional[Path], Optional[str], Optional[Path], list[Path]]:
+    if context.config.output_format not in (OutputFormat.uki, OutputFormat.esp):
+        return None, None, None, []
 
-    with complete_step("Setting up network veth"):
-        network_file = os.path.join(root, "etc/systemd/network/80-mkosi-network-veth.network")
-        with open(network_file, "w") as f:
-            # Adapted from https://github.com/systemd/systemd/blob/v247/network/80-container-host0.network
-            f.write(
-                dedent(
-                    """\
-                    [Match]
-                    Virtualization=!container
-                    Type=ether
+    try:
+        kver, kimg = next(gen_kernel_images(context))
+    except StopIteration:
+        die("A kernel must be installed in the image to build a UKI")
 
-                    [Network]
-                    DHCP=yes
-                    LinkLocalAddressing=yes
-                    LLDP=yes
-                    EmitLLDP=customer-bridge
+    kimg = shutil.copy2(context.root / kimg, context.workspace)
 
-                    [DHCP]
-                    UseTimezone=yes
+    if not context.config.architecture.to_efi():
+        die(f"Architecture {context.config.architecture} does not support UEFI")
+
+    stub = systemd_stub_binary(context)
+    if not stub.exists():
+        die(f"sd-stub not found at /{stub.relative_to(context.root)} in the image")
+
+    stub = shutil.copy2(stub, context.workspace)
+    microcode = build_microcode_initrd(context)
+
+    return stub, kver, kimg, microcode
+
+
+def make_image(
+    context: Context,
+    msg: str,
+    skip: Sequence[str] = [],
+    split: bool = False,
+    tabs: bool = False,
+    root: Optional[Path] = None,
+    definitions: Sequence[Path] = [],
+) -> list[Partition]:
+    cmdline: list[PathString] = [
+        "systemd-repart",
+        "--empty=allow",
+        "--size=auto",
+        "--dry-run=no",
+        "--json=pretty",
+        "--no-pager",
+        f"--offline={yes_no(context.config.repart_offline)}",
+        "--seed", str(context.config.seed),
+        context.staging / context.config.output_with_format,
+    ]
+    mounts = [Mount(context.staging, context.staging)]
+
+    if root:
+        cmdline += ["--root=/buildroot"]
+        mounts += [Mount(root, "/buildroot")]
+    if not context.config.architecture.is_native():
+        cmdline += ["--architecture", str(context.config.architecture)]
+    if not (context.staging / context.config.output_with_format).exists():
+        cmdline += ["--empty=create"]
+    if context.config.passphrase:
+        cmdline += ["--key-file", context.config.passphrase]
+        mounts += [Mount(context.config.passphrase, context.config.passphrase, ro=True)]
+    if context.config.verity_key:
+        cmdline += ["--private-key", context.config.verity_key]
+        if context.config.verity_key_source.type != KeySource.Type.file:
+            cmdline += ["--private-key-source", str(context.config.verity_key_source)]
+        if context.config.verity_key.exists():
+            mounts += [Mount(context.config.verity_key, context.config.verity_key, ro=True)]
+    if context.config.verity_certificate:
+        cmdline += ["--certificate", context.config.verity_certificate]
+        mounts += [Mount(context.config.verity_certificate, context.config.verity_certificate, ro=True)]
+    if skip:
+        cmdline += ["--defer-partitions", ",".join(skip)]
+    if split:
+        cmdline += ["--split=yes"]
+    if context.config.sector_size:
+        cmdline += ["--sector-size", str(context.config.sector_size)]
+    if tabs and systemd_tool_version(context.config, "systemd-repart") >= 256:
+        cmdline += [
+            "--generate-fstab=/etc/fstab",
+            "--generate-crypttab=/etc/crypttab",
+        ]
+
+    for d in definitions:
+        cmdline += ["--definitions", d]
+        mounts += [Mount(d, d, ro=True)]
+
+    with complete_step(msg):
+        output = json.loads(
+            run(
+                cmdline,
+                stdout=subprocess.PIPE,
+                env=context.config.environment,
+                sandbox=context.sandbox(
+                    binary="systemd-repart",
+                    devices=(
+                        not context.config.repart_offline or
+                        context.config.verity_key_source.type != KeySource.Type.file
+                    ),
+                    mounts=mounts,
+                ),
+            ).stdout
+        )
+
+    logging.debug(json.dumps(output, indent=4))
+
+    partitions = [Partition.from_dict(d) for d in output]
+
+    if split:
+        for p in partitions:
+            if p.split_path:
+                maybe_compress(context, context.config.compress_output, p.split_path)
+
+    return partitions
+
+
+def make_disk(
+    context: Context,
+    msg: str,
+    skip: Sequence[str] = [],
+    split: bool = False,
+    tabs: bool = False,
+) -> list[Partition]:
+    if context.config.output_format != OutputFormat.disk:
+        return []
+
+    if context.config.repart_dirs:
+        definitions = context.config.repart_dirs
+    else:
+        defaults = context.workspace / "repart-definitions"
+        if not defaults.exists():
+            defaults.mkdir()
+            if arch := context.config.architecture.to_efi():
+                bootloader = context.root / f"efi/EFI/BOOT/BOOT{arch.upper()}.EFI"
+            else:
+                bootloader = None
+
+            esp = (
+                context.config.bootable == ConfigFeature.enabled or
+                (context.config.bootable == ConfigFeature.auto and bootloader and bootloader.exists())
+            )
+            bios = (context.config.bootable != ConfigFeature.disabled and want_grub_bios(context))
+
+            if esp or bios:
+                # Even if we're doing BIOS, let's still use the ESP to store the kernels, initrds and grub
+                # modules. We cant use UKIs so we have to put each kernel and initrd on the ESP twice, so
+                # let's make the ESP twice as big in that case.
+                (defaults / "00-esp.conf").write_text(
+                    textwrap.dedent(
+                        f"""\
+                        [Partition]
+                        Type=esp
+                        Format=vfat
+                        CopyFiles=/boot:/
+                        CopyFiles=/efi:/
+                        SizeMinBytes={"1G" if bios else "512M"}
+                        SizeMaxBytes={"1G" if bios else "512M"}
+                        """
+                    )
+                )
+
+            # If grub for BIOS is installed, let's add a BIOS boot partition onto which we can install grub.
+            if bios:
+                (defaults / "05-bios.conf").write_text(
+                    textwrap.dedent(
+                        f"""\
+                        [Partition]
+                        Type={Partition.GRUB_BOOT_PARTITION_UUID}
+                        SizeMinBytes=1M
+                        SizeMaxBytes=1M
+                        """
+                    )
+                )
+
+            (defaults / "10-root.conf").write_text(
+                textwrap.dedent(
+                    f"""\
+                    [Partition]
+                    Type=root
+                    Format={context.config.distribution.filesystem()}
+                    CopyFiles=/
+                    Minimize=guess
                     """
                 )
             )
 
-        os.chmod(network_file, 0o644)
+        definitions = [defaults]
 
-        run(["systemctl", "--root", root, "enable", "systemd-networkd"])
+    return make_image(context, msg=msg, skip=skip, split=split, tabs=tabs, root=context.root, definitions=definitions)
 
 
-def build_image(
-    args: CommandLineArguments, root: str, *, do_run_build_script: bool, for_cache: bool = False, cleanup: bool = False
-) -> Tuple[Optional[BinaryIO], Optional[BinaryIO], Optional[str], Optional[TextIO]]:
-    # If there's no build script set, there's no point in executing
-    # the build script iteration. Let's quit early.
-    if args.build_script is None and do_run_build_script:
-        return None, None, None, None
+def make_oci(context: Context, root_layer: Path, dst: Path) -> None:
+    ca_store = dst / "blobs" / "sha256"
+    with umask(~0o755):
+        ca_store.mkdir(parents=True)
 
-    make_build_dir(args)
+    layer_diff_digest = hash_file(root_layer)
+    maybe_compress(
+        context,
+        context.config.compress_output,
+        context.staging / "rootfs.layer",
+        # Pass explicit destination to suppress adding an extension
+        context.staging / "rootfs.layer",
+    )
+    layer_digest = hash_file(root_layer)
+    root_layer.rename(ca_store / layer_digest)
 
-    raw, cached = reuse_cache_image(args, root, do_run_build_script, for_cache)
-    if for_cache and cached:
-        # Found existing cache image, exiting build_image
-        return None, None, None, None
+    creation_time = (
+        datetime.datetime.fromtimestamp(context.config.source_date_epoch, tz=datetime.timezone.utc)
+        if context.config.source_date_epoch is not None
+        else datetime.datetime.now(tz=datetime.timezone.utc)
+    ).isoformat()
 
-    if not cached:
-        raw = create_image(args, root, for_cache)
+    oci_config = {
+        "created": creation_time,
+        "architecture": context.config.architecture.to_oci(),
+        # Name of the operating system which the image is built to run on as defined by
+        # https://github.com/opencontainers/image-spec/blob/v1.0.2/config.md#properties.
+        "os": "linux",
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": [f"sha256:{layer_diff_digest}"],
+        },
+        "config": {
+            "Cmd": [
+                "/sbin/init",
+                *context.config.kernel_command_line,
+            ],
+        },
+        "history": [
+            {
+                "created": creation_time,
+                "comment": "Created by mkosi",
+            },
+        ],
+    }
+    oci_config_blob = json.dumps(oci_config)
+    oci_config_digest = hashlib.sha256(oci_config_blob.encode()).hexdigest()
+    with umask(~0o644):
+        (ca_store / oci_config_digest).write_text(oci_config_blob)
 
-    with attach_image_loopback(args, raw) as loopdev:
+    layer_suffix = context.config.compress_output.oci_media_type_suffix()
+    oci_manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": f"sha256:{oci_config_digest}",
+            "size": (ca_store / oci_config_digest).stat().st_size,
+        },
+        "layers": [
+            {
+                "mediaType": f"application/vnd.oci.image.layer.v1.tar{layer_suffix}",
+                "digest": f"sha256:{layer_digest}",
+                "size": (ca_store / layer_digest).stat().st_size,
+            }
+        ],
+        "annotations": {
+            "io.systemd.mkosi.version": __version__,
+            **({
+                "org.opencontainers.image.version": context.config.image_version,
+            } if context.config.image_version else {}),
+        }
+    }
+    oci_manifest_blob = json.dumps(oci_manifest)
+    oci_manifest_digest = hashlib.sha256(oci_manifest_blob.encode()).hexdigest()
+    with umask(~0o644):
+        (ca_store / oci_manifest_digest).write_text(oci_manifest_blob)
 
-        prepare_swap(args, loopdev, cached)
-        prepare_esp(args, loopdev, cached)
-        prepare_xbootldr(args, loopdev, cached)
-
-        if loopdev is not None:
-            luks_format_root(args, loopdev, do_run_build_script, cached)
-            luks_format_home(args, loopdev, do_run_build_script, cached)
-            luks_format_srv(args, loopdev, do_run_build_script, cached)
-            luks_format_var(args, loopdev, do_run_build_script, cached)
-            luks_format_tmp(args, loopdev, do_run_build_script, cached)
-
-        with luks_setup_all(args, loopdev, do_run_build_script) as (
-            encrypted_root,
-            encrypted_home,
-            encrypted_srv,
-            encrypted_var,
-            encrypted_tmp,
-        ):
-
-            prepare_root(args, encrypted_root, cached)
-            prepare_home(args, encrypted_home, cached)
-            prepare_srv(args, encrypted_srv, cached)
-            prepare_var(args, encrypted_var, cached)
-            prepare_tmp(args, encrypted_tmp, cached)
-
-            # Mount everything together, but let's not mount the root
-            # dir if we still have to generate the root image here
-            prepare_tree_root(args, root)
-            with mount_image(
-                args,
-                root,
-                loopdev,
-                None if args.generated_root() else encrypted_root,
-                encrypted_home,
-                encrypted_srv,
-                encrypted_var,
-                encrypted_tmp,
-            ):
-                prepare_tree(args, root, do_run_build_script, cached)
-                if do_run_build_script and args.include_dir and not cached:
-                    empty_directory(args.include_dir)
-                    # We do a recursive unmount of root so we don't need to explicitly unmount this mount
-                    # later.
-                    mount_bind(args.include_dir, os.path.join(root, "usr/include"))
-
-                cached_tree = reuse_cache_tree(args, root, do_run_build_script, for_cache, cached)
-                install_skeleton_trees(args, root, for_cache)
-                install_distribution(args, root, do_run_build_script, cached_tree)
-                install_etc_hostname(args, root, cached_tree)
-                install_boot_loader(args, root, loopdev, do_run_build_script, cached_tree)
-                run_prepare_script(args, root, do_run_build_script, cached_tree)
-                install_extra_trees(args, root, for_cache)
-                install_build_src(args, root, do_run_build_script, for_cache)
-                install_build_dest(args, root, do_run_build_script, for_cache)
-                set_root_password(args, root, do_run_build_script, cached_tree)
-                set_serial_terminal(args, root, do_run_build_script, cached_tree)
-                set_autologin(args, root, do_run_build_script, cached_tree)
-                sshkey = setup_ssh(args, root, do_run_build_script, for_cache, cached_tree)
-                setup_network_veth(args, root, do_run_build_script, cached_tree)
-                run_postinst_script(args, root, loopdev, do_run_build_script, for_cache)
-
-                if cleanup:
-                    clean_package_manager_metadata(root)
-                reset_machine_id(args, root, do_run_build_script, for_cache)
-                reset_random_seed(args, root)
-                run_finalize_script(args, root, do_run_build_script, for_cache)
-                make_read_only(args, root, for_cache)
-
-            generated_root = make_generated_root(args, root, for_cache)
-            insert_generated_root(args, root, raw, loopdev, generated_root, for_cache)
-
-            verity, root_hash = make_verity(args, root, encrypted_root, do_run_build_script, for_cache)
-            patch_root_uuid(args, loopdev, root_hash, for_cache)
-            insert_verity(args, root, raw, loopdev, verity, root_hash, for_cache)
-
-            # This time we mount read-only, as we already generated
-            # the verity data, and hence really shouldn't modify the
-            # image anymore.
-            mount = lambda: mount_image(
-                args,
-                root,
-                loopdev,
-                None if args.generated_root() and for_cache else encrypted_root,
-                encrypted_home,
-                encrypted_srv,
-                encrypted_var,
-                encrypted_tmp,
-                root_read_only=True,
+        (dst / "index.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": [
+                        {
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": f"sha256:{oci_manifest_digest}",
+                            "size": (ca_store / oci_manifest_digest).stat().st_size,
+                        }
+                    ],
+                }
             )
+        )
 
-            install_unified_kernel(args, root, root_hash, do_run_build_script, for_cache, cached, mount)
-            secure_boot_sign(args, root, do_run_build_script, for_cache, cached, mount)
-
-    tar = make_tar(args, root, do_run_build_script, for_cache)
-
-    return raw or generated_root, tar, root_hash, sshkey
+        (dst / "oci-layout").write_text(json.dumps({"imageLayoutVersion": "1.0.0"}))
 
 
-def workspace(root: str) -> str:
-    return os.path.dirname(root)
+def make_esp(context: Context, uki: Path) -> list[Partition]:
+    if not (arch := context.config.architecture.to_efi()):
+        die(f"Architecture {context.config.architecture} does not support UEFI")
 
+    definitions = context.workspace / "esp-definitions"
+    definitions.mkdir(exist_ok=True)
 
-def var_tmp(root: str) -> str:
-    return mkdir_last(os.path.join(workspace(root), "var-tmp"))
-
-
-def one_zero(b: bool) -> str:
-    return "1" if b else "0"
-
-
-def install_dir(args: CommandLineArguments, root: str) -> str:
-    return args.install_dir or os.path.join(workspace(root), "dest")
-
-
-def nspawn_knows_arg(arg: str) -> bool:
-    return bytes("unrecognized option", "UTF-8") not in run(["systemd-nspawn", arg], stderr=PIPE, check=False).stderr
-
-
-def run_build_script(args: CommandLineArguments, root: str, raw: Optional[BinaryIO]) -> None:
-    if args.build_script is None:
-        return
-
-    with complete_step("Running build script"):
-        os.makedirs(install_dir(args, root), mode=0o755, exist_ok=True)
-
-        target = "--directory=" + root if raw is None else "--image=" + raw.name
-
-        cmdline = [
-            "systemd-nspawn",
-            "--quiet",
-            target,
-            "--uuid=" + args.machine_id,
-            "--machine=mkosi-" + uuid.uuid4().hex,
-            "--as-pid2",
-            "--register=no",
-            "--bind",
-            install_dir(args, root) + ":/root/dest",
-            "--bind=" + var_tmp(root) + ":/var/tmp",
-            "--setenv=WITH_DOCS=" + one_zero(args.with_docs),
-            "--setenv=WITH_TESTS=" + one_zero(args.with_tests),
-            "--setenv=WITH_NETWORK=" + one_zero(args.with_network),
-            "--setenv=DESTDIR=/root/dest",
-        ]
-
-        for env in args.build_env:
-            cmdline.append(f"--setenv={env}")
-
-        # TODO: Use --autopipe once systemd v247 is widely available.
-        console_arg = f"--console={'interactive' if sys.stdout.isatty() else 'pipe'}"
-        if nspawn_knows_arg(console_arg):
-            cmdline.append(console_arg)
-
-        if args.default_path is not None:
-            cmdline.append("--setenv=MKOSI_DEFAULT=" + args.default_path)
-
-        cmdline += nspawn_params_for_build_sources(args, args.source_file_transfer)
-
-        if args.build_dir is not None:
-            cmdline.append("--setenv=BUILDDIR=/root/build")
-            cmdline.append("--bind=" + args.build_dir + ":/root/build")
-
-        if args.include_dir is not None:
-            cmdline.append(f"--bind={args.include_dir}:/usr/include")
-
-        if args.with_network:
-            # If we're using the host network namespace, use the same resolver
-            cmdline.append("--bind-ro=/etc/resolv.conf")
-        else:
-            cmdline.append("--private-network")
-
-        cmdline.append("/root/" + os.path.basename(args.build_script))
-        cmdline += args.cmdline
-
-        # build-script output goes to stdout so we can run language servers from within mkosi build-scripts.
-        # See https://github.com/systemd/mkosi/pull/566 for more information.
-        result = run(cmdline, stdout=sys.stdout, check=False)
-        if result.returncode != 0:
-            if "build-script" in arg_debug:
-                run(cmdline[:-1], check=False)
-            die(f"Build script returned non-zero exit code {result.returncode}.")
-
-
-def need_cache_images(args: CommandLineArguments) -> bool:
-    if not args.incremental:
-        return False
-
-    if args.force_count > 1:
-        return True
-
-    return not os.path.exists(args.cache_pre_dev) or not os.path.exists(args.cache_pre_inst)
-
-
-def remove_artifacts(
-    args: CommandLineArguments,
-    root: str,
-    raw: Optional[BinaryIO],
-    tar: Optional[BinaryIO],
-    do_run_build_script: bool,
-    for_cache: bool = False,
-) -> None:
-    if for_cache:
-        what = "cache build"
-    elif do_run_build_script:
-        what = "development build"
+    # Use a minimum of 36MB or 260MB depending on sector size because otherwise the generated FAT filesystem will have
+    # too few clusters to be considered a FAT32 filesystem by OVMF which will refuse to boot from it.
+    # See https://superuser.com/questions/1702331/what-is-the-minimum-size-of-a-4k-native-partition-when-formatted-with-fat32/1717643#1717643
+    if context.config.sector_size == 512:
+        m = 36
+    # TODO: Figure out minimum size for 2K sector size
     else:
+        m = 260
+
+    # Always reserve 10MB for filesystem metadata.
+    size = max(uki.stat().st_size, (m - 10) * 1024**2) + 10 * 1024**2
+
+    # TODO: Remove the extra 4096 for the max size once https://github.com/systemd/systemd/pull/29954 is in a stable
+    # release.
+    (definitions / "00-esp.conf").write_text(
+        textwrap.dedent(
+            f"""\
+            [Partition]
+            Type=esp
+            Format=vfat
+            CopyFiles={uki}:/EFI/BOOT/BOOT{arch.upper()}.EFI
+            SizeMinBytes={size}
+            SizeMaxBytes={size + 4096}
+            """
+        )
+    )
+
+    return make_image(context, msg="Generating ESP image", definitions=[definitions])
+
+
+def make_extension_image(context: Context, output: Path) -> None:
+    r = context.resources / f"repart/definitions/{context.config.output_format}.repart.d"
+
+    cmdline: list[PathString] = [
+        "systemd-repart",
+        "--root=/buildroot",
+        "--json=pretty",
+        "--dry-run=no",
+        "--no-pager",
+        f"--offline={yes_no(context.config.repart_offline)}",
+        "--seed", str(context.config.seed) if context.config.seed else "random",
+        "--empty=create",
+        "--size=auto",
+        "--definitions", r,
+        output,
+    ]
+    mounts = [
+        Mount(output.parent, output.parent),
+        Mount(context.root, "/buildroot", ro=True),
+        Mount(r, r, ro=True),
+    ]
+
+    if not context.config.architecture.is_native():
+        cmdline += ["--architecture", str(context.config.architecture)]
+    if context.config.passphrase:
+        cmdline += ["--key-file", context.config.passphrase]
+        mounts += [Mount(context.config.passphrase, context.config.passphrase, ro=True)]
+    if context.config.verity_key:
+        cmdline += ["--private-key", context.config.verity_key]
+        if context.config.verity_key_source.type != KeySource.Type.file:
+            cmdline += ["--private-key-source", str(context.config.verity_key_source)]
+        if context.config.verity_key.exists():
+            mounts += [Mount(context.config.verity_key, context.config.verity_key, ro=True)]
+    if context.config.verity_certificate:
+        cmdline += ["--certificate", context.config.verity_certificate]
+        mounts += [Mount(context.config.verity_certificate, context.config.verity_certificate, ro=True)]
+    if context.config.sector_size:
+        cmdline += ["--sector-size", str(context.config.sector_size)]
+    if context.config.split_artifacts:
+        cmdline += ["--split=yes"]
+
+    with complete_step(f"Building {context.config.output_format} extension image"):
+        j = json.loads(
+            run(
+                cmdline,
+                stdout=subprocess.PIPE,
+                env=context.config.environment,
+                sandbox=context.sandbox(
+                    binary="systemd-repart",
+                    devices=(
+                        not context.config.repart_offline or
+                        context.config.verity_key_source.type != KeySource.Type.file
+                    ),
+                    mounts=mounts,
+                ),
+            ).stdout
+        )
+
+    logging.debug(json.dumps(j, indent=4))
+
+    if context.config.split_artifacts:
+        for p in (Partition.from_dict(d) for d in j):
+            if p.split_path:
+                maybe_compress(context, context.config.compress_output, p.split_path)
+
+
+def finalize_staging(context: Context) -> None:
+    rmtree(*(context.config.output_dir_or_cwd() / f.name for f in context.staging.iterdir()))
+
+    for f in context.staging.iterdir():
+        # Make sure all build outputs that are not directories are owned by the user running mkosi.
+        if not f.is_dir():
+            os.chown(f, INVOKING_USER.uid, INVOKING_USER.gid, follow_symlinks=False)
+
+        if f.is_symlink():
+            (context.config.output_dir_or_cwd() / f.name).symlink_to(f.readlink())
+            os.chown(f, INVOKING_USER.uid, INVOKING_USER.gid, follow_symlinks=False)
+            continue
+
+        move_tree(
+            f, context.config.output_dir_or_cwd(),
+            use_subvolumes=context.config.use_subvolumes,
+            sandbox=context.sandbox,
+        )
+
+
+def clamp_mtime(path: Path, mtime: int) -> None:
+    st = os.stat(path, follow_symlinks=False)
+    orig = (st.st_atime_ns, st.st_mtime_ns)
+    updated = (min(orig[0], mtime * 1_000_000_000),
+               min(orig[1], mtime * 1_000_000_000))
+    if orig != updated:
+        os.utime(path, ns=updated, follow_symlinks=False)
+
+
+def normalize_mtime(root: Path, mtime: Optional[int], directory: Path = Path("")) -> None:
+    if mtime is None:
         return
 
-    if raw is not None:
-        with complete_step("Removing disk image from " + what):
-            del raw
+    if not (root / directory).exists():
+        return
 
-    if tar is not None:
-        with complete_step("Removing tar image from " + what):
-            del tar
-
-    with complete_step("Removing artifacts from " + what):
-        unlink_try_hard(root)
-        unlink_try_hard(var_tmp(root))
-
-
-def build_stuff(args: CommandLineArguments) -> None:
-    # Let's define a fixed machine ID for all our build-time
-    # runs. We'll strip it off the final image, but some build-time
-    # tools (dracut...) want a fixed one, hence provide one, and
-    # always the same
-    args.machine_id = uuid.uuid4().hex
-
-    make_output_dir(args)
-    setup_package_cache(args)
-    workspace = setup_workspace(args)
-
-    # Make sure tmpfiles' aging doesn't interfere with our workspace
-    # while we are working on it.
-    with open_close(
-        workspace.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    ) as dir_fd, btrfs_forget_stale_devices():
-        fcntl.flock(dir_fd, fcntl.LOCK_EX)
-
-        root = os.path.join(workspace.name, "root")
-
-        # If caching is requested, then make sure we have cache images around we can make use of
-        if need_cache_images(args):
-
-            # There is no point generating a pre-dev cache image if no build script is provided
-            if args.build_script:
-                with complete_step("Running first (development) stage to generate cached copy"):
-                    # Generate the cache version of the build image, and store it as "cache-pre-dev"
-                    raw, tar, root_hash, sshkey = build_image(args, root, do_run_build_script=True, for_cache=True)
-                    save_cache(args, root, raw.name if raw is not None else None, args.cache_pre_dev)
-
-                    remove_artifacts(args, root, raw, tar, do_run_build_script=True)
-
-            with complete_step("Running second (final) stage to generate cached copy"):
-                # Generate the cache version of the build image, and store it as "cache-pre-inst"
-                raw, tar, root_hash, sshkey = build_image(args, root, do_run_build_script=False, for_cache=True)
-
-                if raw:
-                    save_cache(args, root, raw.name, args.cache_pre_inst)
-                    remove_artifacts(args, root, raw, tar, do_run_build_script=False)
-
-        if args.build_script:
-            with complete_step("Running first (development) stage"):
-                # Run the image builder for the first (development) stage in preparation for the build script
-                raw, tar, root_hash, sshkey = build_image(args, root, do_run_build_script=True)
-
-                run_build_script(args, root, raw)
-                remove_artifacts(args, root, raw, tar, do_run_build_script=True)
-
-        # Run the image builder for the second (final) stage
-        if not args.skip_final_phase:
-            with complete_step("Running second (final) stage"):
-                raw, tar, root_hash, sshkey = build_image(args, root, do_run_build_script=False, cleanup=True)
-        else:
-            MkosiPrinter.print_step("Skipping (second) final image build phase.")
-
-        raw = qcow2_output(args, raw)
-        raw = xz_output(args, raw)
-        root_hash_file = write_root_hash_file(args, root_hash)
-        settings = copy_nspawn_settings(args)
-        checksum = calculate_sha256sum(args, raw, tar, root_hash_file, settings)
-        signature = calculate_signature(args, checksum)
-        bmap = calculate_bmap(args, raw)
-
-        link_output(args, root, raw or tar)
-        link_output_root_hash_file(args, root_hash_file.name if root_hash_file is not None else None)
-        link_output_checksum(args, checksum.name if checksum is not None else None)
-        link_output_signature(args, signature.name if signature is not None else None)
-        link_output_bmap(args, bmap.name if bmap is not None else None)
-        link_output_nspawn_settings(args, settings.name if settings is not None else None)
-        link_output_sshkey(args, sshkey.name if sshkey is not None else None)
-
-        if root_hash is not None:
-            MkosiPrinter.print_step(f"Root hash is {root_hash}.")
-
-
-def check_root() -> None:
-    if os.getuid() != 0:
-        die("Must be invoked as root.")
-
-
-def check_native(args: CommandLineArguments) -> None:
-    if args.architecture is not None and args.architecture != platform.machine() and args.build_script:
-        die("Cannot (currently) override the architecture and run build commands")
+    with complete_step(f"Normalizing modification times of /{directory}"):
+        clamp_mtime(root / directory, mtime)
+        for p in (root / directory).rglob("*"):
+            clamp_mtime(p, mtime)
 
 
 @contextlib.contextmanager
-def suppress_stacktrace() -> Generator[None, None, None]:
-    try:
-        yield
-    except subprocess.CalledProcessError as e:
-        # MkosiException is silenced in main() so it doesn't print a stacktrace.
-        raise MkosiException(e)
+def setup_workspace(args: Args, config: Config) -> Iterator[Path]:
+    with contextlib.ExitStack() as stack:
+        workspace = Path(tempfile.mkdtemp(dir=config.workspace_dir_or_default(), prefix="mkosi-workspace-"))
+        # Discard setuid/setgid bits as these are inherited and can leak into the image.
+        workspace.chmod(stat.S_IMODE(workspace.stat().st_mode) & ~(stat.S_ISGID|stat.S_ISUID))
+        stack.callback(lambda: rmtree(workspace, sandbox=config.sandbox))
+        (workspace / "tmp").mkdir(mode=0o1777)
+
+        with scopedenv({"TMPDIR" : os.fspath(workspace / "tmp")}):
+            try:
+                yield Path(workspace)
+            except BaseException:
+                if args.debug_workspace:
+                    stack.pop_all()
+                    log_notice(f"Workspace: {workspace}")
+                    workspace.chmod(0o755)
+
+                raise
 
 
-def virt_name(args: CommandLineArguments) -> str:
-    name = args.hostname or os.path.splitext(os.path.basename(args.output))[0]
-    # Shorten to 13 characters so we can prefix with ve- or vt- for the network veth ifname which is limited
-    # to 16 characters.
-    return cast(str, name[:13])
-
-
-def has_networkd_vm_vt() -> bool:
-    for path in ["/usr/lib/systemd/network", "/lib/systemd/network", "/etc/systemd/network"]:
-        if os.path.exists(os.path.join(path, "80-vm-vt.network")):
-            return True
-
-    return False
-
-
-def ensure_networkd(args: CommandLineArguments) -> None:
-    networkd_is_running = run(["systemctl", "is-active", "--quiet", "systemd-networkd"], check=False).returncode == 0
-    if not networkd_is_running:
-        warn(
-            """
-            --network-veth requires systemd-networkd to be running to initialize the host interface of the
-            veth link (`systemctl enable --now systemd-networkd`)")
-            """
-        )
-
-    if args.verb == "qemu" and not has_networkd_vm_vt():
-        warn(
-            r"""
-            mkosi didn't find 80-vm-vt.network. This is one of systemd's built-in systemd-networkd config
-            files which configures vt-* interfaces. mkosi needs this file in order for --network-veth to work
-            properly for QEMU virtual machines. The file likely cannot be found because the systemd version
-            on the host is too old (< 246) and it isn't included yet.
-
-            As a workaround until the file is shipped by the systemd package of your distro, add a user
-            network file /etc/systemd/network/80-vm-vt.network with the following contents:
-
-            ```
-            [Match]
-            Name=vt-*
-            Driver=tun
-
-            [Network]
-            # Default to using a /28 prefix, giving up to 13 addresses per VM.
-            Address=0.0.0.0/28
-            LinkLocalAddressing=yes
-            DHCPServer=yes
-            IPMasquerade=yes
-            LLDP=yes
-            EmitLLDP=customer-bridge
-            IPv6PrefixDelegation=yes
-            ```
-            """
-        )
-
-
-def run_shell(args: CommandLineArguments) -> None:
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
-        target = f"--directory={args.output}"
-    else:
-        target = f"--image={args.output}"
-
-    cmdline = ["systemd-nspawn", target]
-
-    if args.read_only:
-        cmdline.append("--read-only")
-
-    # If we copied in a .nspawn file, make sure it's actually honoured
-    if args.nspawn_settings is not None:
-        cmdline.append("--settings=trusted")
-
-    if args.verb == "boot":
-        cmdline.append("--boot")
-
-    if args.generated_root() or args.verity:
-        cmdline.append("--volatile=overlay")
-
-    if args.network_veth:
-        ensure_networkd(args)
-        cmdline.append("--network-veth")
-
-    if args.ephemeral:
-        cmdline.append("--ephemeral")
-
-    cmdline += ["--machine", virt_name(args)]
-
-    if args.cmdline:
-        # If the verb is shell, args.cmdline contains the command to run. Otherwise (boot), we assume
-        # args.cmdline contains nspawn arguments.
-        if args.verb == "shell":
-            cmdline.append("--")
-        cmdline += args.cmdline
-
-    with suppress_stacktrace():
-        run(cmdline, stdout=sys.stdout, stderr=sys.stderr)
-
-
-def find_qemu_binary() -> str:
-    ARCH_BINARIES = {"x86_64": "qemu-system-x86_64", "i386": "qemu-system-i386"}
-    arch_binary = ARCH_BINARIES.get(platform.machine())
-
-    binaries: List[str] = []
-    if arch_binary is not None:
-        binaries.append(arch_binary)
-    binaries += ["qemu", "qemu-kvm"]
-    for binary in binaries:
-        if shutil.which(binary) is not None:
-            return binary
-
-    die("Couldn't find QEMU/KVM binary")
-
-
-def find_qemu_firmware() -> Tuple[str, bool]:
-    # UEFI firmware blobs are found in a variety of locations,
-    # depending on distribution and package.
-    FIRMWARE_LOCATIONS = []
-
-    if platform.machine() == "x86_64":
-        FIRMWARE_LOCATIONS.append("/usr/share/ovmf/x64/OVMF_CODE.secboot.fd")
-    elif platform.machine() == "i386":
-        FIRMWARE_LOCATIONS.append("/usr/share/edk2/ovmf-ia32/OVMF_CODE.secboot.fd")
-
-    FIRMWARE_LOCATIONS.append("/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd")
-    FIRMWARE_LOCATIONS.append("/usr/share/qemu/OVMF_CODE.secboot.fd")
-    FIRMWARE_LOCATIONS.append("/usr/share/ovmf/OVMF.secboot.fd")
-
-    for firmware in FIRMWARE_LOCATIONS:
-        if os.path.exists(firmware):
-            return firmware, True
-
-    warn(
-        """\
-        Couldn't find OVMF firmware blob with secure boot support,
-        falling back to OVMF firmware blobs without secure boot support.
-        """
-    )
-
-    FIRMWARE_LOCATIONS = []
-
-    # First, we look in paths that contain the architecture –
-    # if they exist, they’re almost certainly correct.
-    if platform.machine() == "x86_64":
-        FIRMWARE_LOCATIONS.append("/usr/share/ovmf/ovmf_code_x64.bin")
-        FIRMWARE_LOCATIONS.append("/usr/share/ovmf/x64/OVMF_CODE.fd")
-        FIRMWARE_LOCATIONS.append("/usr/share/qemu/ovmf-x86_64.bin")
-    elif platform.machine() == "i386":
-        FIRMWARE_LOCATIONS.append("/usr/share/ovmf/ovmf_code_ia32.bin")
-        FIRMWARE_LOCATIONS.append("/usr/share/edk2/ovmf-ia32/OVMF_CODE.fd")
-    # After that, we try some generic paths and hope that if they exist,
-    # they’ll correspond to the current architecture, thanks to the package manager.
-    FIRMWARE_LOCATIONS.append("/usr/share/edk2/ovmf/OVMF_CODE.fd")
-    FIRMWARE_LOCATIONS.append("/usr/share/qemu/OVMF_CODE.fd")
-    FIRMWARE_LOCATIONS.append("/usr/share/ovmf/OVMF.fd")
-
-    for firmware in FIRMWARE_LOCATIONS:
-        if os.path.exists(firmware):
-            return firmware, False
-
-    die("Couldn't find OVMF UEFI firmware blob.")
-
-
-def find_ovmf_vars() -> str:
-    OVMF_VARS_LOCATIONS = []
-
-    if platform.machine() == "x86_64":
-        OVMF_VARS_LOCATIONS.append("/usr/share/ovmf/x64/OVMF_VARS.fd")
-    elif platform.machine() == "i386":
-        OVMF_VARS_LOCATIONS.append("/usr/share/edk2/ovmf-ia32/OVMF_VARS.fd")
-
-    OVMF_VARS_LOCATIONS.append("/usr/share/edk2/ovmf/OVMF_VARS.fd")
-    OVMF_VARS_LOCATIONS.append("/usr/share/qemu/OVMF_VARS.fd")
-    OVMF_VARS_LOCATIONS.append("/usr/share/ovmf/OVMF_VARS.fd")
-
-    for location in OVMF_VARS_LOCATIONS:
-        if os.path.exists(location):
-            return location
-
-    die("Couldn't find OVMF UEFI variables file.")
-
-
-def run_qemu(args: CommandLineArguments) -> None:
-    has_kvm = os.path.exists("/dev/kvm")
-    accel = "kvm" if has_kvm else "tcg"
-
-    firmware, fw_supports_sb = find_qemu_firmware()
-
-    cmdline = [
-        find_qemu_binary(),
-        "-machine",
-        f"type=q35,accel={accel},smm={'on' if fw_supports_sb else 'off'}",
-        "-smp",
-        "2",
-        "-m",
-        "1024",
-        "-object",
-        "rng-random,filename=/dev/urandom,id=rng0",
-        "-device",
-        "virtio-rng-pci,rng=rng0,id=rng-device0",
-    ]
-
-    if has_kvm:
-        cmdline += ["-cpu", "host"]
-
-    if args.qemu_headless:
-        # -nodefaults removes the default CDROM device which avoids an error message during boot
-        # -serial mon:stdio adds back the serial device removed by -nodefaults.
-        cmdline += ["-nographic", "-nodefaults", "-serial", "mon:stdio"]
-        # Fix for https://github.com/systemd/mkosi/issues/559. QEMU gets stuck in a boot loop when using BIOS
-        # if there's no vga device.
-
-    if not args.qemu_headless or (args.qemu_headless and "bios" in args.boot_protocols):
-        cmdline += ["-vga", "virtio"]
-
-    if args.network_veth:
-        ensure_networkd(args)
-        # Use vt- prefix so we can take advantage of systemd-networkd's builtin network file for VMs.
-        ifname = f"vt-{virt_name(args)}"
-        # vt-<image-name> is the ifname on the host and is automatically picked up by systemd-networkd which
-        # starts a DHCP server on that interface. This gives IP connectivity to the VM. By default, QEMU
-        # itself tries to bring up the vt network interface which conflicts with systemd-networkd which is
-        # trying to do the same. By specifiying script=no and downscript=no, We tell QEMU to not touch vt
-        # after it is created.
-        cmdline += ["-nic", f"tap,script=no,downscript=no,ifname={ifname},model=virtio-net-pci"]
-
-    if "uefi" in args.boot_protocols:
-        cmdline += ["-drive", f"if=pflash,format=raw,readonly,file={firmware}"]
+@contextlib.contextmanager
+def lock_repository_metadata(config: Config) -> Iterator[None]:
+    subdir = config.distribution.package_manager(config).subdir(config)
 
     with contextlib.ExitStack() as stack:
-        if fw_supports_sb:
-            ovmf_vars = stack.enter_context(copy_file_temporary(src=find_ovmf_vars(), dir=tmp_dir()))
-            cmdline += [
-                "-global",
-                "ICH9-LPC.disable_s3=1",
-                "-global",
-                "driver=cfi.pflash01,property=secure,value=on",
-                "-drive",
-                f"file={ovmf_vars.name},if=pflash,format=raw",
-            ]
+        for d in ("cache", "lib"):
+            if (src := config.package_cache_dir_or_default() / d / subdir).exists():
+                stack.enter_context(flock(src))
 
-        if args.ephemeral:
-            f = stack.enter_context(copy_image_temporary(src=args.output, dir=os.path.dirname(args.output)))
-            fname = f.name
-        else:
-            fname = args.output
+        yield
 
+
+def copy_repository_metadata(context: Context) -> None:
+    subdir = context.config.distribution.package_manager(context.config).subdir(context.config)
+
+    # Don't copy anything if the repository metadata directories are already populated and we're not explicitly asked
+    # to sync repository metadata.
+    if (
+        context.config.cacheonly != Cacheonly.never and
+        (
+            any((context.package_cache_dir / "cache" / subdir).glob("*")) or
+            any((context.package_cache_dir / "lib" / subdir).glob("*"))
+        )
+    ):
+        logging.debug(f"Found repository metadata in {context.package_cache_dir}, not copying repository metadata")
+        return
+
+    with lock_repository_metadata(context.config):
+        for d in ("cache", "lib"):
+            src = context.config.package_cache_dir_or_default() / d / subdir
+            if not src.exists():
+                logging.debug(f"{src} does not exist, not copying repository metadata from it")
+                continue
+
+            if d == "cache":
+                caches = context.config.distribution.package_manager(context.config).cache_subdirs(src)
+            else:
+                caches = []
+
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chmod(tmp, 0o755)
+
+                # cp doesn't support excluding directories but we can imitate it by bind mounting an empty directory
+                # over the directories we want to exclude.
+                exclude = [Mount(tmp, p, ro=True) for p in caches]
+
+                dst = context.package_cache_dir / d / subdir
+                with umask(~0o755):
+                    dst.mkdir(parents=True, exist_ok=True)
+
+                def sandbox(
+                    *,
+                    binary: Optional[PathString],
+                    mounts: Sequence[Mount] = (),
+                    extra: Sequence[PathString] = (),
+                ) -> AbstractContextManager[list[PathString]]:
+                    return context.sandbox(binary=binary, mounts=[*mounts, *exclude], extra=extra)
+
+                copy_tree(
+                    src, dst,
+                    preserve=False,
+                    sandbox=sandbox,
+                )
+
+
+def build_image(context: Context) -> None:
+    manifest = Manifest(context) if context.config.manifest_format else None
+
+    install_package_manager_trees(context)
+
+    with mount_base_trees(context):
+        install_base_trees(context)
+        cached = reuse_cache(context)
+
+        with mount_cache_overlay(context, cached):
+            copy_repository_metadata(context)
+
+        context.config.distribution.setup(context)
+        install_package_directories(context)
+
+        if not cached:
+            with mount_cache_overlay(context, cached):
+                install_skeleton_trees(context)
+                install_distribution(context)
+                run_prepare_scripts(context, build=False)
+                install_build_packages(context)
+                run_prepare_scripts(context, build=True)
+                fixup_vmlinuz_location(context)
+                run_depmod(context, cache=True)
+
+            save_cache(context)
+            reuse_cache(context)
+
+        check_root_populated(context)
+        run_build_scripts(context)
+
+        if context.config.output_format == OutputFormat.none:
+            # Touch an empty file to indicate the image was built.
+            (context.staging / context.config.output).touch()
+            finalize_staging(context)
+            return
+
+        install_volatile_packages(context)
+        install_build_dest(context)
+        install_extra_trees(context)
+        run_postinst_scripts(context)
+        fixup_vmlinuz_location(context)
+
+        configure_autologin(context)
+        configure_os_release(context)
+        configure_extension_release(context)
+        configure_initrd(context)
+        configure_ssh(context)
+        configure_clock(context)
+
+        install_systemd_boot(context)
+        install_grub(context)
+        install_shim(context)
+        run_sysusers(context)
+        run_tmpfiles(context)
+        run_preset(context)
+        run_depmod(context)
+        run_firstboot(context)
+        run_hwdb(context)
+
+        # These might be removed by the next steps, so let's save them for later if needed.
+        stub, kver, kimg, microcode = save_uki_components(context)
+
+        remove_packages(context)
+
+        if manifest:
+            manifest.record_packages()
+
+        clean_package_manager_metadata(context)
+        remove_files(context)
+        run_selinux_relabel(context)
+        run_finalize_scripts(context)
+
+    normalize_mtime(context.root, context.config.source_date_epoch)
+    partitions = make_disk(context, skip=("esp", "xbootldr"), tabs=True, msg="Generating disk image")
+    install_kernel(context, partitions)
+    normalize_mtime(context.root, context.config.source_date_epoch, directory=Path("boot"))
+    normalize_mtime(context.root, context.config.source_date_epoch, directory=Path("efi"))
+    partitions = make_disk(context, msg="Formatting ESP/XBOOTLDR partitions")
+    grub_bios_setup(context, partitions)
+
+    if context.config.split_artifacts:
+        make_disk(context, split=True, msg="Extracting partitions")
+
+    copy_nspawn_settings(context)
+    copy_uki(context)
+    copy_vmlinuz(context)
+    copy_initrd(context)
+
+    if context.config.output_format == OutputFormat.tar:
+        make_tar(context.root, context.staging / context.config.output_with_format, sandbox=context.sandbox)
+    elif context.config.output_format == OutputFormat.oci:
+        make_tar(context.root, context.staging / "rootfs.layer", sandbox=context.sandbox)
+        make_oci(
+            context,
+            context.staging / "rootfs.layer",
+            context.staging / context.config.output_with_format,
+        )
+    elif context.config.output_format == OutputFormat.cpio:
+        make_cpio(context.root, context.staging / context.config.output_with_format, sandbox=context.sandbox)
+    elif context.config.output_format == OutputFormat.uki:
+        assert stub and kver and kimg
+        make_uki(context, stub, kver, kimg, microcode, context.staging / context.config.output_with_format)
+    elif context.config.output_format == OutputFormat.esp:
+        assert stub and kver and kimg
+        make_uki(context, stub, kver, kimg, microcode, context.staging / context.config.output_split_uki)
+        make_esp(context, context.staging / context.config.output_split_uki)
+    elif context.config.output_format.is_extension_image():
+        make_extension_image(context, context.staging / context.config.output_with_format)
+    elif context.config.output_format == OutputFormat.directory:
+        context.root.rename(context.staging / context.config.output_with_format)
+
+    if context.config.output_format not in (OutputFormat.uki, OutputFormat.esp):
+        maybe_compress(context, context.config.compress_output,
+                       context.staging / context.config.output_with_format,
+                       context.staging / context.config.output_with_compression)
+
+    calculate_sha256sum(context)
+    calculate_signature(context)
+    save_manifest(context, manifest)
+
+    output_base = context.staging / context.config.output
+    if not output_base.exists() or output_base.is_symlink():
+        output_base.unlink(missing_ok=True)
+        output_base.symlink_to(context.config.output_with_compression)
+
+    finalize_staging(context)
+
+    print_output_size(context.config.output_dir_or_cwd() / context.config.output_with_compression)
+
+
+def setfacl(config: Config, root: Path, uid: int, allow: bool) -> None:
+    run(
+        [
+            "setfacl",
+            "--physical",
+            "--modify" if allow else "--remove",
+            f"user:{uid}:rwx" if allow else f"user:{uid}",
+            "-",
+        ],
+        # Supply files via stdin so we don't clutter --debug run output too much
+        input="\n".join([str(root), *(os.fspath(p) for p in root.rglob("*") if p.is_dir())]),
+        sandbox=config.sandbox(binary="setfacl", mounts=[Mount(root, root)]),
+    )
+
+
+@contextlib.contextmanager
+def acl_maybe_toggle(config: Config, root: Path, uid: int, *, always: bool) -> Iterator[None]:
+    if not config.acl:
+        yield
+        return
+
+    # getfacl complains about absolute paths so make sure we pass a relative one.
+    if root.exists():
+        sandbox = config.sandbox(binary="getfacl", mounts=[Mount(root, root)], options=["--chdir", root])
+        has_acl = f"user:{uid}:rwx" in run(["getfacl", "-n", "."], sandbox=sandbox, stdout=subprocess.PIPE).stdout
+
+        if not has_acl and not always:
+            yield
+            return
+    else:
+        has_acl = False
+
+    try:
+        if has_acl:
+            with complete_step(f"Removing ACLs from {root}"):
+                setfacl(config, root, uid, allow=False)
+
+        yield
+    finally:
+        if has_acl or always:
+            with complete_step(f"Adding ACLs to {root}"):
+                setfacl(config, root, uid, allow=True)
+
+
+@contextlib.contextmanager
+def acl_toggle_build(config: Config, uid: int) -> Iterator[None]:
+    if not config.acl:
+        yield
+        return
+
+    extras = [t.source for t in config.extra_trees]
+    skeletons = [t.source for t in config.skeleton_trees]
+
+    with contextlib.ExitStack() as stack:
+        for p in (*config.base_trees, *extras, *skeletons):
+            if p and p.is_dir():
+                stack.enter_context(acl_maybe_toggle(config, p, uid, always=False))
+
+        for p in (config.cache_dir, config.build_dir):
+            if p:
+                stack.enter_context(acl_maybe_toggle(config, p, uid, always=True))
+
+        if config.output_format == OutputFormat.directory:
+            stack.enter_context(acl_maybe_toggle(config, config.output_dir_or_cwd() / config.output, uid, always=True))
+
+        yield
+
+
+@contextlib.contextmanager
+def acl_toggle_boot(config: Config, uid: int) -> Iterator[None]:
+    if not config.acl or config.output_format != OutputFormat.directory:
+        yield
+        return
+
+    with acl_maybe_toggle(config, config.output_dir_or_cwd() / config.output, uid, always=False):
+        yield
+
+
+def run_shell(args: Args, config: Config) -> None:
+    opname = "acquire shell in" if args.verb == Verb.shell else "boot"
+    if config.output_format in (OutputFormat.tar, OutputFormat.cpio):
+        die(f"Sorry, can't {opname} a {config.output_format} archive.")
+    if config.output_format.use_outer_compression() and config.compress_output:
+        die(f"Sorry, can't {opname} a compressed image.")
+
+    cmdline: list[PathString] = ["systemd-nspawn", "--quiet", "--link-journal=no"]
+
+    if config.runtime_network == Network.user:
+        cmdline += ["--resolv-conf=auto"]
+    elif config.runtime_network == Network.interface:
+        if os.getuid() != 0:
+            die("RuntimeNetwork=interface requires root privileges")
+
+        cmdline += ["--private-network", "--network-veth"]
+    elif config.runtime_network == Network.none:
+        cmdline += ["--private-network"]
+
+    # If we copied in a .nspawn file, make sure it's actually honoured
+    if config.nspawn_settings:
+        cmdline += ["--settings=trusted"]
+
+    if args.verb == Verb.boot:
+        cmdline += ["--boot"]
+    else:
         cmdline += [
-            "-drive",
-            f"if=none,id=hd,file={fname},format={'qcow2' if args.qcow2 else 'raw'}",
-            "-device",
-            "virtio-scsi-pci,id=scsi",
-            "-device",
-            "scsi-hd,drive=hd,bootindex=1",
+            f"--rlimit=RLIMIT_CORE={format_rlimit(resource.RLIMIT_CORE)}",
+            "--console=autopipe",
         ]
 
-        cmdline += args.cmdline
+    # Underscores are not allowed in machine names so replace them with hyphens.
+    name = config.machine_or_name().replace("_", "-")
+    cmdline += ["--machine", name]
 
-        print_running_cmd(cmdline)
+    for k, v in config.credentials.items():
+        cmdline += [f"--set-credential={k}:{v}"]
 
-        with suppress_stacktrace():
-            run(cmdline, stdout=sys.stdout, stderr=sys.stderr)
+    with contextlib.ExitStack() as stack:
+        # Make sure the latest nspawn settings are always used.
+        if config.nspawn_settings:
+            if not (config.output_dir_or_cwd() / f"{name}.nspawn").exists():
+                stack.callback(lambda: (config.output_dir_or_cwd() / f"{name}.nspawn").unlink(missing_ok=True))
+            shutil.copy2(config.nspawn_settings, config.output_dir_or_cwd() / f"{name}.nspawn")
 
+        if config.ephemeral:
+            fname = stack.enter_context(copy_ephemeral(config, config.output_dir_or_cwd() / config.output))
+        else:
+            fname = stack.enter_context(flock_or_die(config.output_dir_or_cwd() / config.output))
 
-def interface_exists(dev: str) -> bool:
-    return run(["ip", "link", "show", dev], stdout=DEVNULL, stderr=DEVNULL, check=False).returncode == 0
-
-
-def find_address(args: CommandLineArguments) -> Tuple[str, str]:
-    name = virt_name(args)
-
-    if interface_exists(f"ve-{name}"):
-        dev = f"ve-{name}"
-    elif interface_exists(f"vt-{name}"):
-        dev = f"vt-{name}"
-    else:
-        die("Container/VM interface not found")
-
-    link = json.loads(run(["ip", "-j", "link", "show", "dev", dev], stdout=PIPE, text=True).stdout)[0]
-    if link["operstate"] == "DOWN":
-        die(f"{dev} is not enabled. Make sure systemd-networkd is running so it can manage the interface.")
-
-    # Trigger IPv6 neighbor discovery of which we can access the results via `ip neighbor`. This allows us to
-    # find out the link-local IPv6 address of the container/VM via which we can connect to it.
-    run(["ping", "-c", "1", "-w", "15", f"ff02::1%{dev}"], stdout=DEVNULL)
-
-    for _ in range(50):
-        neighbors = json.loads(run(["ip", "-j", "neighbor", "show", "dev", dev], stdout=PIPE, text=True).stdout)
-
-        for neighbor in neighbors:
-            dst = cast(str, neighbor["dst"])
-            if dst.startswith("fe80"):
-                return dev, dst
-
-        time.sleep(0.4)
-
-    die("Container/VM address not found")
-
-
-def run_ssh(args: CommandLineArguments) -> None:
-    if not os.path.exists(args.output_sshkey):
-        die(
-            f"SSH key not found at {args.output_sshkey}. Are you running from the project's root directory "
-            "and did you build with the --ssh option?"
-        )
-
-    dev, address = find_address(args)
-
-    with suppress_stacktrace():
-        run(
-            [
-                "ssh",
-                "-i",
-                args.output_sshkey,
-                # Silence known hosts file errors/warnings.
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "LogLevel ERROR",
-                f"root@{address}%{dev}",
-                *args.cmdline,
-            ],
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-
-
-def generate_secure_boot_key(args: CommandLineArguments) -> NoReturn:
-    """Generate secure boot keys using openssl"""
-    args.secure_boot_key = args.secure_boot_key or "./mkosi.secure-boot.key"
-    args.secure_boot_certificate = args.secure_boot_certificate or "./mkosi.secure-boot.crt"
-
-    keylength = 2048
-    expiration_date = datetime.date.today() + datetime.timedelta(int(args.secure_boot_valid_days))
-    cn = expand_specifier(args.secure_boot_common_name)
-
-    for f in (args.secure_boot_key, args.secure_boot_certificate):
-        if os.path.exists(f) and not args.force:
-            die(
-                dedent(
-                    f"""\
-                    {f} already exists.
-                    If you are sure you want to generate new secure boot keys
-                    remove {args.secure_boot_key} and {args.secure_boot_certificate} first.
-                    """
-                )
+        if config.output_format == OutputFormat.disk and args.verb == Verb.boot:
+            run(
+                [
+                    "systemd-repart",
+                    "--image", fname,
+                    *([f"--size={config.runtime_size}"] if config.runtime_size else []),
+                    "--no-pager",
+                    "--dry-run=no",
+                    "--offline=no",
+                    "--pretty=no",
+                    fname,
+                ],
+                stdin=sys.stdin,
+                env=config.environment,
+                sandbox=config.sandbox(
+                    binary="systemd-repart",
+                    network=True,
+                    devices=True,
+                    mounts=[Mount(fname, fname)],
+                ),
             )
 
-    MkosiPrinter.print_step(f"Generating secure boot keys rsa:{keylength} for CN `{cn}`.")
-    MkosiPrinter.info(
-        dedent(
+        if config.output_format == OutputFormat.directory:
+            cmdline += ["--directory", fname]
+
+            owner = os.stat(fname).st_uid
+            if owner != 0:
+                cmdline += [f"--private-users={str(owner)}"]
+        else:
+            cmdline += ["--image", fname]
+
+        if config.runtime_build_sources:
+            with finalize_source_mounts(config, ephemeral=False) as mounts:
+                for mount in mounts:
+                    uidmap = "rootidmap" if Path(mount.src).stat().st_uid == INVOKING_USER.uid else "noidmap"
+                    cmdline += ["--bind", f"{mount.src}:{mount.dst}:norbind,{uidmap}"]
+
+            if config.build_dir:
+                cmdline += ["--bind", f"{config.build_dir}:/work/build:norbind,noidmap"]
+
+        for tree in config.runtime_trees:
+            target = Path("/root/src") / (tree.target or "")
+            # We add norbind because very often RuntimeTrees= will be used to mount the source directory into the
+            # container and the output directory from which we're running will very likely be a subdirectory of the
+            # source directory which would mean we'd be mounting the container root directory as a subdirectory in
+            # itself which tends to lead to all kinds of weird issues, which we avoid by not doing a recursive mount
+            # which means the container root directory mounts will be skipped.
+            uidmap = "rootidmap" if tree.source.stat().st_uid == INVOKING_USER.uid else "noidmap"
+            cmdline += ["--bind", f"{tree.source}:{target}:norbind,{uidmap}"]
+
+        if config.runtime_scratch == ConfigFeature.enabled or (
+            config.runtime_scratch == ConfigFeature.auto and
+            config.output_format == OutputFormat.disk
+        ):
+            scratch = stack.enter_context(tempfile.TemporaryDirectory(dir="/var/tmp"))
+            os.chmod(scratch, 0o1777)
+            cmdline += ["--bind", f"{scratch}:/var/tmp"]
+
+        if args.verb == Verb.boot and config.forward_journal:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                addr = Path(os.getenv("TMPDIR", "/tmp")) / f"mkosi-journal-remote-unix-{uuid.uuid4().hex[:16]}"
+                sock.bind(os.fspath(addr))
+                sock.listen()
+                if config.output_format == OutputFormat.directory and (stat := os.stat(fname)).st_uid != 0:
+                    os.chown(addr, stat.st_uid, stat.st_gid)
+                stack.enter_context(start_journal_remote(config, sock.fileno()))
+                cmdline += [
+                    "--bind", f"{addr}:/run/host/journal/socket",
+                    "--set-credential=journal.forward_to_socket:/run/host/journal/socket",
+                ]
+
+        for p in config.unit_properties:
+            cmdline += ["--property", p]
+
+        if args.verb == Verb.boot:
+            # Add nspawn options first since systemd-nspawn ignores all options after the first argument.
+            argv = args.cmdline
+
+            # When invoked by the kernel, all unknown arguments are passed as environment variables to pid1. Let's
+            # mimick the same behavior when we invoke nspawn as a container.
+            for arg in itertools.chain(config.kernel_command_line, config.kernel_command_line_extra):
+                name, sep, value = arg.partition("=")
+
+                # If there's a '.' in the argument name, it's not considered an environment variable by the kernel.
+                if sep and "." not in name:
+                    cmdline += ["--setenv", f"{name.replace('-', '_')}={value}"]
+                else:
+                    # kernel cmdline config of the form systemd.xxx= get interpreted by systemd when running in nspawn
+                    # as well.
+                    argv += [arg]
+
+            cmdline += argv
+        elif args.cmdline:
+            cmdline += ["--"]
+            cmdline += args.cmdline
+
+        run(
+            cmdline,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            env=os.environ | config.environment,
+            log=False,
+            sandbox=config.sandbox(binary="systemd-nspawn", devices=True, network=True, relaxed=True),
+        )
+
+
+def run_systemd_tool(tool: str, args: Args, config: Config) -> None:
+    if config.output_format not in (OutputFormat.disk, OutputFormat.directory) and not config.forward_journal:
+        die(f"{config.output_format} images cannot be inspected with {tool}")
+
+    if (
+        args.verb in (Verb.journalctl, Verb.coredumpctl)
+        and config.output_format == OutputFormat.disk
+        and not config.forward_journal
+        and os.getuid() != 0
+    ):
+        die(f"Must be root to run the {args.verb} command")
+
+    if (tool_path := config.find_binary(tool)) is None:
+        die(f"Failed to find {tool}")
+
+    if config.ephemeral and not config.forward_journal:
+        die(f"Images booted in ephemeral mode cannot be inspected with {tool}")
+
+    output = config.output_dir_or_cwd() / config.output
+
+    if config.forward_journal and not config.forward_journal.exists():
+        die(f"Journal directory/file configured with ForwardJournal= does not exist, cannot inspect with {tool}")
+    elif not output.exists():
+        die(f"Output {config.output_dir_or_cwd() / config.output} does not exist, cannot inspect with {tool}")
+
+    cmd: list[PathString] = [tool_path]
+
+    if config.forward_journal:
+        cmd += ["--directory" if config.forward_journal.is_dir() else "--file", config.forward_journal]
+    else:
+        cmd += ["--root" if output.is_dir() else "--image", output]
+
+    run(
+        [*cmd, *args.cmdline],
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        env=os.environ | config.environment,
+        log=False,
+        preexec_fn=become_root if not config.forward_journal else None,
+        sandbox=config.sandbox(
+            binary=tool_path,
+            network=True,
+            devices=config.output_format == OutputFormat.disk,
+            relaxed=True,
+        ),
+    )
+
+
+def run_journalctl(args: Args, config: Config) -> None:
+    run_systemd_tool("journalctl", args, config)
+
+
+def run_coredumpctl(args: Args, config: Config) -> None:
+    run_systemd_tool("coredumpctl", args, config)
+
+
+def run_serve(args: Args, config: Config) -> None:
+    """Serve the output directory via a tiny HTTP server"""
+
+    run(
+        [python_binary(config), "-m", "http.server", "8081"],
+        stdin=sys.stdin, stdout=sys.stdout,
+        sandbox=config.sandbox(
+            binary=python_binary(config),
+            network=True,
+            relaxed=True,
+            options=["--chdir", config.output_dir_or_cwd()],
+        ),
+    )
+
+
+def generate_key_cert_pair(args: Args) -> None:
+    """Generate a private key and accompanying X509 certificate using openssl"""
+
+    keylength = 2048
+    expiration_date = datetime.date.today() + datetime.timedelta(int(args.genkey_valid_days))
+    cn = expand_specifier(args.genkey_common_name)
+
+    for f in ("mkosi.key", "mkosi.crt"):
+        if Path(f).exists() and not args.force:
+            die(f"{f} already exists",
+                hint=("To generate new keys, first remove mkosi.key and mkosi.crt"))
+
+    log_step(f"Generating keys rsa:{keylength} for CN {cn!r}.")
+    logging.info(
+        textwrap.dedent(
             f"""
-            The keys will expire in {args.secure_boot_valid_days} days ({expiration_date:%A %d. %B %Y}).
+            The keys will expire in {args.genkey_valid_days} days ({expiration_date:%A %d. %B %Y}).
             Remember to roll them over to new ones before then.
             """
         )
     )
 
-    cmd = [
-        "openssl",
-        "req",
-        "-new",
-        "-x509",
-        "-newkey",
-        f"rsa:{keylength}",
-        "-keyout",
-        args.secure_boot_key,
-        "-out",
-        args.secure_boot_certificate,
-        "-days",
-        str(args.secure_boot_valid_days),
-        "-subj",
-        f"/CN={cn}/",
-    ]
-
-    os.execvp(cmd[0], cmd)
+    run(
+        [
+            "openssl",
+            "req",
+            "-new",
+            "-x509",
+            "-newkey", f"rsa:{keylength}",
+            "-keyout", "mkosi.key",
+            "-out", "mkosi.crt",
+            "-days", str(args.genkey_valid_days),
+            "-subj", f"/CN={cn}/",
+            "-nodes"
+        ],
+        env=dict(OPENSSL_CONF="/dev/null"),
+    )
 
 
-def expand_paths(paths: List[str]) -> List[str]:
-    if not paths:
-        return []
+def bump_image_version() -> None:
+    """Write current image version plus one to mkosi.version"""
+    version = Path("mkosi.version").read_text().strip()
+    v = version.split(".")
 
-    environ = os.environ.copy()
-    # Add a fake SUDO_HOME variable to allow non-root users specify
-    # paths in their home when using mkosi via sudo.
-    sudo_user = os.getenv("SUDO_USER")
-    if sudo_user and "SUDO_HOME" not in environ:
-        environ["SUDO_HOME"] = os.path.expanduser(f"~{sudo_user}")
-
-    # No os.path.expandvars because it treats unset variables as empty.
-    expanded = []
-    for path in paths:
-        try:
-            path = string.Template(path).substitute(environ)
-            expanded.append(path)
-        except KeyError:
-            # Skip path if it uses a variable not defined.
-            pass
-    return expanded
-
-
-def prepend_to_environ_path(paths: List[str]) -> None:
-    if not paths:
-        return
-
-    original_path = os.getenv("PATH", None)
-    new_path = ":".join(paths)
-
-    if original_path is None:
-        os.environ["PATH"] = new_path
+    try:
+        m = int(v[-1])
+    except ValueError:
+        new_version = version + ".2"
+        logging.info(
+            "Last component of current version is not a decimal integer, "
+            f"appending '.2', bumping '{version}' → '{new_version}'."
+        )
     else:
-        os.environ["PATH"] = new_path + ":" + original_path
+        new_version = ".".join(v[:-1] + [str(m + 1)])
+        logging.info(f"Increasing last component of version by one, bumping '{version}' → '{new_version}'.")
+
+    Path("mkosi.version").write_text(f"{new_version}\n")
+    os.chown("mkosi.version", INVOKING_USER.uid, INVOKING_USER.gid)
+
+
+def show_docs(args: Args, *, resources: Path) -> None:
+    if args.doc_format == DocFormat.auto:
+        formats = [DocFormat.man, DocFormat.pandoc, DocFormat.markdown, DocFormat.system]
+    else:
+        formats = [args.doc_format]
+
+    while formats:
+        form = formats.pop(0)
+        try:
+            if form == DocFormat.man:
+                man = resources / "mkosi.1"
+                if not man.exists():
+                    raise FileNotFoundError()
+                run(["man", "--local-file", man])
+                return
+            elif form == DocFormat.pandoc:
+                if not find_binary("pandoc"):
+                    logging.error("pandoc is not available")
+                pandoc = run(["pandoc", "-t", "man", "-s", resources / "mkosi.md"], stdout=subprocess.PIPE)
+                run(["man", "--local-file", "-"], input=pandoc.stdout)
+                return
+            elif form == DocFormat.markdown:
+                page((resources / "mkosi.md").read_text(), args.pager)
+                return
+            elif form == DocFormat.system:
+                run(["man", "mkosi"])
+                return
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            if not formats:
+                if isinstance(e, FileNotFoundError):
+                    die("The mkosi package does not contain the man page.")
+                raise e
 
 
 def expand_specifier(s: str) -> str:
-    user = os.getenv("SUDO_USER") or os.getenv("USER")
-    assert user is not None
-    return s.replace("%u", user)
+    return s.replace("%u", INVOKING_USER.name())
 
 
-def needs_build(args: CommandLineArguments) -> bool:
-    return args.verb == "build" or (not os.path.exists(args.output) and args.verb in MKOSI_COMMANDS_NEED_BUILD)
+@contextlib.contextmanager
+def prepend_to_environ_path(config: Config) -> Iterator[None]:
+    if not config.extra_search_paths:
+        yield
+        return
+
+    with tempfile.TemporaryDirectory(prefix="mkosi.path-") as d:
+
+        for path in config.extra_search_paths:
+            if not path.is_dir():
+                (Path(d) / path.name).symlink_to(path.absolute())
+
+        news = [os.fspath(path) for path in [Path(d), *config.extra_search_paths] if path.is_dir()]
+        olds = os.getenv("PATH", "").split(":")
+        os.environ["PATH"] = ":".join(news + olds)
+
+        try:
+            yield
+        finally:
+            os.environ["PATH"] = ":".join(olds)
 
 
-def run_verb(args: CommandLineArguments) -> None:
-    load_args(args)
+def finalize_default_tools(args: Args, config: Config, *, resources: Path) -> Config:
+    if not config.tools_tree_distribution:
+        die(f"{config.distribution} does not have a default tools tree distribution",
+            hint="use ToolsTreeDistribution= to set one explicitly")
 
-    prepend_to_environ_path(args.extra_search_paths)
+    cmdline = [
+        "--directory", "",
+        "--distribution", str(config.tools_tree_distribution),
+        *(["--release", config.tools_tree_release] if config.tools_tree_release else []),
+        *(["--mirror", config.tools_tree_mirror] if config.tools_tree_mirror else []),
+        "--repositories", ",".join(config.tools_tree_repositories),
+        "--package-manager-tree", ",".join(str(t) for t in config.tools_tree_package_manager_trees),
+        "--repository-key-check", str(config.repository_key_check),
+        "--cache-only", str(config.cacheonly),
+        *(["--output-dir", str(config.output_dir)] if config.output_dir else []),
+        *(["--workspace-dir", str(config.workspace_dir)] if config.workspace_dir else []),
+        *(["--cache-dir", str(config.cache_dir)] if config.cache_dir else []),
+        *(["--package-cache-dir", str(config.package_cache_dir)] if config.package_cache_dir else []),
+        "--incremental", str(config.incremental),
+        "--acl", str(config.acl),
+        *([f"--package={package}" for package in config.tools_tree_packages]),
+        "--output", f"{config.tools_tree_distribution}-tools",
+        *(["--source-date-epoch", str(config.source_date_epoch)] if config.source_date_epoch is not None else []),
+        *([f"--environment={k}='{v}'" for k, v in config.environment.items()]),
+        *([f"--extra-search-path={p}" for p in config.extra_search_paths]),
+        *(["--proxy-url", config.proxy_url] if config.proxy_url else []),
+        *([f"--proxy-exclude={host}" for host in config.proxy_exclude]),
+        *(["--proxy-peer-certificate", str(p)] if (p := config.proxy_peer_certificate) else []),
+        *(["--proxy-client-certificate", str(p)] if (p := config.proxy_client_certificate) else []),
+        *(["--proxy-client-key", str(p)] if (p := config.proxy_client_key) else []),
+        *(["-f"] * args.force),
+    ]
 
-    if args.verb == "genkey":
-        generate_secure_boot_key(args)
+    _, [tools] = parse_config(
+        cmdline + ["--include=mkosi-tools", "build"],
+        resources=resources,
+    )
 
-    if args.verb in MKOSI_COMMANDS_SUDO:
-        check_root()
-        unlink_output(args)
+    tools = dataclasses.replace(tools, image=f"{config.tools_tree_distribution}-tools")
 
-    if args.verb == "build":
-        check_output(args)
+    return tools
 
-    if args.verb == "summary" or (needs_build(args) and need_cache_images(args)):
-        print_summary(args)
 
-    if needs_build(args):
-        check_root()
-        check_native(args)
-        init_namespace(args)
-        build_stuff(args)
-        print_output_size(args)
+def check_workspace_directory(config: Config) -> None:
+    wd = config.workspace_dir_or_default()
 
-    if args.verb in ("shell", "boot"):
-        run_shell(args)
+    for tree in config.build_sources:
+        if wd.is_relative_to(tree.source):
+            die(f"The workspace directory ({wd}) cannot be a subdirectory of any source directory ({tree.source})",
+                hint="Use WorkspaceDirectory= to configure a different workspace directory")
 
-    if args.verb == "qemu":
-        run_qemu(args)
 
-    if args.verb == "ssh":
-        run_ssh(args)
+def run_clean_scripts(config: Config) -> None:
+    if not config.clean_scripts:
+        return
+
+    for script in config.clean_scripts:
+        if not os.access(script, os.X_OK):
+            die(f"{script} is not executable")
+
+    env = dict(
+        DISTRIBUTION=str(config.distribution),
+        RELEASE=config.release,
+        ARCHITECTURE=str(config.architecture),
+        SRCDIR="/work/src",
+        OUTPUTDIR="/work/out",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+    )
+
+    if config.profile:
+        env["PROFILE"] = config.profile
+
+    with finalize_source_mounts(config, ephemeral=False) as sources:
+        for script in config.clean_scripts:
+            with complete_step(f"Running clean script {script}…"):
+                run(
+                    ["/work/clean"],
+                    env=env | config.environment,
+                    sandbox=config.sandbox(
+                        binary=None,
+                        tools=False,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/clean", ro=True),
+                            *([Mount(o, "/work/out")] if (o := config.output_dir_or_cwd()).exists() else []),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src", "--dir", "/work/out"]
+                    ),
+                    stdin=sys.stdin,
+                )
+
+
+def needs_clean(args: Args, config: Config, force: int = 1) -> bool:
+    return (
+        args.verb == Verb.clean or
+        args.force >= force or
+        not (config.output_dir_or_cwd() / config.output_with_compression).exists() or
+        # When the output is a directory, its name is the same as the symlink we create that points to the actual
+        # output when not building a directory. So if the full output path exists, we have to check that it's not
+        # a symlink as well.
+        (config.output_dir_or_cwd() / config.output_with_compression).is_symlink()
+    )
+
+
+def run_clean(args: Args, config: Config, *, resources: Path) -> None:
+    if not needs_clean(args, config):
+        return
+
+    become_root()
+
+    # We remove any cached images if either the user used --force twice, or he/she called "clean" with it
+    # passed once. Let's also remove the downloaded package cache if the user specified one additional
+    # "--force".
+
+    if args.verb == Verb.clean:
+        remove_build_cache = args.force > 0
+        remove_package_cache = args.force > 1
+    else:
+        remove_build_cache = args.force > 1
+        remove_package_cache = args.force > 2
+
+    outputs = {
+        config.output_dir_or_cwd() / output
+        for output in config.outputs
+        if (config.output_dir_or_cwd() / output).exists()
+    }
+
+    # Make sure we resolve the symlink we create in the output directory and remove its target as well as it might not
+    # be in the list of outputs anymore if the compression or output format was changed.
+    outputs |= {o.resolve() for o in outputs}
+
+    if outputs:
+        with (
+            complete_step(f"Removing output files of {config.name()} image…"),
+            flock_or_die(config.output_dir_or_cwd() / config.output)
+            if (config.output_dir_or_cwd() / config.output).exists()
+            else contextlib.nullcontext()
+        ):
+            rmtree(*outputs)
+
+    if remove_build_cache:
+        if config.cache_dir:
+            initrd = (
+                cache_tree_paths(finalize_default_initrd(args, config, resources=resources))
+                if config.distribution != Distribution.custom
+                else []
+            )
+
+            if any(p.exists() for p in itertools.chain(cache_tree_paths(config), initrd)):
+                with complete_step(f"Removing cache entries of {config.name()} image…"):
+                    rmtree(*(p for p in itertools.chain(cache_tree_paths(config), initrd) if p.exists()))
+
+        if config.build_dir and config.build_dir.exists() and any(config.build_dir.iterdir()):
+            with complete_step(f"Clearing out build directory of {config.name()} image…"):
+                rmtree(*config.build_dir.iterdir())
+
+    if (
+        remove_package_cache and
+        any(config.package_cache_dir_or_default().glob("*"))
+    ):
+        subdir = config.distribution.package_manager(config).subdir(config)
+
+        with (
+            complete_step(f"Clearing out package cache of {config.name()} image…"),
+            lock_repository_metadata(config),
+        ):
+            rmtree(
+                *(
+                    config.package_cache_dir_or_default() / d / subdir
+                    for d in ("cache", "lib")
+                ),
+            )
+
+    run_clean_scripts(config)
+
+
+@contextlib.contextmanager
+def rchown_package_manager_dirs(config: Config) -> Iterator[None]:
+    try:
+        yield
+    finally:
+        if INVOKING_USER.is_regular_user():
+            with complete_step("Fixing ownership of package manager cache directory"):
+                subdir = config.distribution.package_manager(config).subdir(config)
+                for d in ("cache", "lib"):
+                    INVOKING_USER.rchown(config.package_cache_dir_or_default() / d / subdir)
+
+
+def sync_repository_metadata(context: Context) -> None:
+    if (
+        context.config.cacheonly != Cacheonly.never and
+        (have_cache(context.config) or context.config.cacheonly != Cacheonly.auto)
+    ):
+        return
+
+    with (
+        complete_step(f"Syncing package manager metadata for {context.config.name()} image"),
+        lock_repository_metadata(context.config),
+    ):
+        context.config.distribution.package_manager(context.config).sync(context)
+
+
+def run_sync(args: Args, config: Config, *, resources: Path) -> None:
+    if os.getuid() == 0:
+        os.setgroups(INVOKING_USER.extra_groups())
+        os.setgid(INVOKING_USER.gid)
+        os.setuid(INVOKING_USER.uid)
+
+    if not (p := config.package_cache_dir_or_default()).exists():
+        p.mkdir(parents=True, exist_ok=True)
+
+    subdir = config.distribution.package_manager(config).subdir(config)
+
+    for d in ("cache", "lib"):
+        (config.package_cache_dir_or_default() / d / subdir).mkdir(parents=True, exist_ok=True)
+
+    with (
+        prepend_to_environ_path(config),
+        setup_workspace(args, config) as workspace,
+    ):
+        context = Context(
+            args,
+            config,
+            workspace=workspace,
+            resources=resources,
+            package_cache_dir=config.package_cache_dir_or_default(),
+        )
+
+        install_package_manager_trees(context)
+        context.config.distribution.setup(context)
+
+        sync_repository_metadata(context)
+
+        src = config.package_cache_dir_or_default() / "cache" / subdir
+        for p in config.distribution.package_manager(config).cache_subdirs(src):
+            p.mkdir(parents=True, exist_ok=True)
+
+        run_sync_scripts(context)
+
+
+def run_build(args: Args, config: Config, *, resources: Path) -> None:
+    for p in (
+        config.output_dir,
+        config.cache_dir,
+        config.package_cache_dir_or_default(),
+        config.build_dir,
+        config.workspace_dir,
+    ):
+        if not p or p.exists():
+            continue
+
+        p.mkdir(parents=True, exist_ok=True)
+        INVOKING_USER.chown(p)
+
+    if (uid := os.getuid()) != 0:
+        become_root()
+    unshare(CLONE_NEWNS)
+    if uid == 0:
+        run(["mount", "--make-rslave", "/"])
+
+    if config.build_dir:
+        # Make sure the build directory is owned by root (in the user namespace) so that the correct uid-mapping is
+        # applied if it is used in RuntimeTrees=
+        os.chown(config.build_dir, os.getuid(), os.getgid())
+
+        # Discard setuid/setgid bits as these are inherited and can leak into the image.
+        config.build_dir.chmod(stat.S_IMODE(config.build_dir.stat().st_mode) & ~(stat.S_ISGID|stat.S_ISUID))
+
+    # For extra safety when running as root, remount a bunch of stuff read-only.
+    # Because some build systems use output directories in /usr, we only remount
+    # /usr read-only if the output directory is not relative to it.
+    remount = ["/etc", "/opt", "/boot", "/efi", "/media"]
+    if not config.output_dir_or_cwd().is_relative_to("/usr"):
+        remount += ["/usr"]
+
+    for d in remount:
+        if Path(d).exists():
+            run(["mount", "--rbind", d, d, "--options", "ro"])
+
+    with (
+        complete_step(f"Building {config.name()} image"),
+        prepend_to_environ_path(config),
+    ):
+        check_tools(config, Verb.build)
+
+        with (
+            acl_toggle_build(config, INVOKING_USER.uid),
+            rchown_package_manager_dirs(config),
+            setup_workspace(args, config) as workspace,
+        ):
+            build_image(Context(args, config, workspace=workspace, resources=resources))
+
+
+def run_verb(args: Args, images: Sequence[Config], *, resources: Path) -> None:
+    images = list(images)
+
+    if args.verb.needs_root() and os.getuid() != 0:
+        die(f"Must be root to run the {args.verb} command")
+
+    if args.verb == Verb.documentation:
+        return show_docs(args, resources=resources)
+
+    if args.verb == Verb.genkey:
+        return generate_key_cert_pair(args)
+
+    if args.verb == Verb.bump:
+        return bump_image_version()
+
+    if all(config == Config.default() for config in images):
+        die("No configuration found",
+            hint="Make sure you're running mkosi from a directory with configuration files")
+
+    if args.verb == Verb.summary:
+        if args.json:
+            text = json.dumps(
+                {"Images": [config.to_dict() for config in images]},
+                cls=JsonEncoder,
+                indent=4,
+                sort_keys=True
+            )
+        else:
+            text = "\n".join(summary(config) for config in images)
+
+        page(text, args.pager)
+        return
+
+    if args.verb in (Verb.journalctl, Verb.coredumpctl, Verb.ssh):
+        # We don't use a tools tree for verbs that don't need an image build.
+        last = dataclasses.replace(images[-1], tools_tree=None)
+        return {
+            Verb.ssh: run_ssh,
+            Verb.journalctl: run_journalctl,
+            Verb.coredumpctl: run_coredumpctl,
+        }[args.verb](args, last)
+
+    assert args.verb.needs_build() or args.verb == Verb.clean
+
+    for config in images:
+        if args.verb == Verb.build and not args.force:
+            check_outputs(config)
+
+    last = images[-1]
+
+    if last.tools_tree and last.tools_tree == Path("default"):
+        tools = finalize_default_tools(args, last, resources=resources)
+
+        # If we're doing an incremental tools tree and the cache is not out of date, don't clean up the tools tree
+        # so that we can reuse the previous one.
+        if not tools.incremental or not have_cache(tools) or needs_clean(args, tools, force=2):
+            fork_and_wait(run_clean, args, tools, resources=resources)
+    else:
+        tools = None
+
+    # First, process all directory removals because otherwise if different images share directories a later
+    # image build could end up deleting the output generated by an earlier image build.
+    for config in images:
+        fork_and_wait(run_clean, args, config, resources=resources)
+
+    if args.verb == Verb.clean:
+        return
+
+    for config in images:
+        if (minversion := config.minimum_version) and minversion > __version__:
+            die(f"mkosi {minversion} or newer is required to build this configuration (found {__version__})")
+
+        if not config.repart_offline and os.getuid() != 0:
+            die(f"Must be root to build {config.name()} image configured with RepartOffline=no")
+
+        check_workspace_directory(config)
+
+    if tools and not (tools.output_dir_or_cwd() / tools.output).exists():
+        if args.verb == Verb.build or args.force > 0:
+            fork_and_wait(run_sync, args, tools, resources=resources)
+            fork_and_wait(run_build, args, tools, resources=resources)
+        else:
+            die(f"Default tools tree requested for image '{last.name()}' but it has not been built yet",
+                hint="Make sure to build the image first with 'mkosi build' or use '--force'")
+
+    build = False
+
+    for i, config in enumerate(images):
+        images[i] = config = dataclasses.replace(
+            config,
+            tools_tree=(
+                tools.output_dir_or_cwd() / tools.output
+                if tools and config.tools_tree == Path("default")
+                else config.tools_tree
+            )
+        )
+
+        images[i] = config = run_configure_scripts(config)
+
+        if args.verb != Verb.build and args.force == 0:
+            continue
+
+        if (config.output_dir_or_cwd() / config.output_with_compression).exists():
+            continue
+
+        check_inputs(config)
+        fork_and_wait(run_sync, args, config, resources=resources)
+        fork_and_wait(run_build, args, config, resources=resources)
+
+        build = True
+
+    if build and args.auto_bump:
+        bump_image_version()
+
+    if args.verb == Verb.build:
+        return
+
+    # The images array has been modified so we need to reevaluate last again.
+    last = images[-1]
+
+    if not (last.output_dir_or_cwd() / last.output_with_compression).exists():
+        die(f"Image '{last.name()}' has not been built yet",
+            hint="Make sure to build the image first with 'mkosi build' or use '--force'")
+
+    with prepend_to_environ_path(last):
+        check_tools(last, args.verb)
+
+        with (
+            acl_toggle_boot(last, INVOKING_USER.uid)
+            if args.verb in (Verb.shell, Verb.boot)
+            else contextlib.nullcontext()
+        ):
+            run_vm = {
+                Vmm.qemu: run_qemu,
+                Vmm.vmspawn: run_vmspawn,
+            }[last.vmm]
+
+            {
+                Verb.shell: run_shell,
+                Verb.boot: run_shell,
+                Verb.qemu: run_vm,
+                Verb.serve: run_serve,
+                Verb.burn: run_burn,
+            }[args.verb](args, last)

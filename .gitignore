@@ -1,6 +1,8 @@
+.venv
 *.cache-pre-dev
 *.cache-pre-inst
 .cache
+.mkosi.1
 .mypy_cache/
 .project
 .pydevproject
@@ -12,10 +14,14 @@
 /dist
 /mkosi.build
 /mkosi.egg-info
-/mkosi.extra
+/mkosi.cache
+/mkosi.output
 /mkosi.nspawn
 /mkosi.rootpw
-/mkosi.default
-/mkosi.secure-boot.key
-/mkosi.secure-boot.crt
+mkosi.local.conf
+/mkosi.key
+/mkosi.crt
 __pycache__
+blog/output
+blog/pelicanconf.py
+blog/publishconf.py
